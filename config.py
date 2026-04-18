@@ -1,0 +1,12 @@
+#add API 
+#and Secret here
+
+SYMBOLS = ["SPY", "QQQ", "AAPL"]
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+MAX_POSITIONS = 3
+
+TRADE_SIZE = 1  # number of shares
+STOP_LOSS_PERCENT = 0.02  # 2% stop loss
+TRAILING_STOP_PERCENT = 0.02  # 2%
