@@ -9,6 +9,19 @@ highest_price = {}
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
+def get_total_market_value():
+    try:
+        positions = trading_client.get_all_positions()
+        total = sum(float(p.market_value) for p in positions)
+        return total
+    except Exception as e:
+        print(f"Error getting total market value: {e}")
+        return 0.0
+
+
+def already_holding(symbol):
+    return get_position(symbol) > 0
+
 def get_open_positions_count():
     positions = trading_client.get_all_positions()
     return len(positions)

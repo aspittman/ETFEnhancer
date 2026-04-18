@@ -1,47 +1,118 @@
-from trader import place_trade, print_account_info, print_position, check_stop_loss
+from trader import (
+    place_trade,
+    print_account_info,
+    print_position,
+    check_stop_loss,
+    check_trailing_stop,
+    get_open_positions_count,
+    get_total_market_value,
+    already_holding,
+    trading_client,
+    calculate_qty
+)
+
+from strategy import scan_universe, wait_for_market_open
+from universe import UNIVERSE
+
+from config import (
+    DOLLARS_PER_TRADE,
+    MAX_POSITIONS,
+    MAX_TOTAL_CAPITAL,
+    STOP_LOSS_PERCENT,
+    TRAILING_STOP_PERCENT,
+    MA_SHORT,
+    MA_LONG,
+    MACD_FAST,
+    MACD_SLOW,
+    MACD_SIGNAL,
+    SCAN_INTERVAL_SECONDS,
+    MAX_CANDIDATES_PER_CYCLE
+)
+
 import time
-from config import SYMBOLS, RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT, TRADE_SIZE, STOP_LOSS_PERCENT
-from strategy import check_signal
-from trader import place_trade
-from strategy import wait_for_market_open
-from trader import trading_client
-from trader import place_trade, print_account_info, print_position
-from trader import check_trailing_stop
-from trader import get_open_positions_count
-from config import TRAILING_STOP_PERCENT, MAX_POSITIONS
+import traceback
 
-wait_for_market_open(trading_client)
 
-print("Starting Alpaca Paper Trading Bot...")
+def run_bot():
+    wait_for_market_open(trading_client)
+    print("Starting trend scanner bot...")
 
-last_action = None
+    while True:
+        print("\n==============================")
+        print("NEW BOT CYCLE STARTING")
+        print("==============================")
 
-while True:
-    for symbol in SYMBOLS:
-        print(f"\n=== Checking {symbol} ===")
+        # Manage exits first
+        print("\n=== MANAGING OPEN POSITIONS ===")
+        for symbol in UNIVERSE:
+            try:
+                stop_triggered = check_stop_loss(symbol, STOP_LOSS_PERCENT)
+                trailing_triggered = check_trailing_stop(symbol, TRAILING_STOP_PERCENT)
 
-        signal = check_signal(
-            symbol,
-            RSI_PERIOD,
-            RSI_OVERSOLD,
-            RSI_OVERBOUGHT
+                if already_holding(symbol):
+                    print_position(symbol)
+
+            except Exception as e:
+                print(f"Error managing {symbol}: {e}")
+
+        # Scan for new entries
+        print("\n=== SCANNING FOR NEW ENTRIES ===")
+        candidates = scan_universe(
+            UNIVERSE,
+            MA_SHORT,
+            MA_LONG,
+            MACD_FAST,
+            MACD_SLOW,
+            MACD_SIGNAL
         )
 
-        print(f"{symbol} Signal: {signal}")
+        print(f"Found {len(candidates)} candidates.")
 
-        stop_triggered = check_stop_loss(symbol, STOP_LOSS_PERCENT)
-        trailing_triggered = check_trailing_stop(symbol, TRAILING_STOP_PERCENT)
+        open_positions = get_open_positions_count()
+        total_capital_used = get_total_market_value()
 
-        if not stop_triggered and not trailing_triggered:
-            if signal in ["buy", "sell"]:
-                if get_open_positions_count() < MAX_POSITIONS:
-                    place_trade(symbol, signal, TRADE_SIZE)
-                    time.sleep(3)
-                else:
-                    print("Max positions reached. Skipping trade.")
+        for candidate in candidates[:MAX_CANDIDATES_PER_CYCLE]:
+            symbol = candidate["symbol"]
+            price = candidate["price"]
 
-        print_position(symbol)
+            if open_positions >= MAX_POSITIONS:
+                print("Max positions reached.")
+                break
 
-    print_account_info()
+            if total_capital_used + DOLLARS_PER_TRADE > MAX_TOTAL_CAPITAL:
+                print("Max total capital reached.")
+                break
 
-    time.sleep(300)
+            if already_holding(symbol):
+                print(f"Already holding {symbol}. Skipping.")
+                continue
+
+            qty = calculate_qty(symbol, DOLLARS_PER_TRADE)
+
+            if qty <= 0:
+                print(f"Calculated qty for {symbol} is 0. Skipping.")
+                continue
+
+            print(f"Buying {qty} shares of {symbol} at about ${price:.2f}")
+            place_trade(symbol, "buy", qty)
+            time.sleep(3)
+
+            open_positions = get_open_positions_count()
+            total_capital_used = get_total_market_value()
+
+        print_account_info()
+        time.sleep(SCAN_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    while True:
+        try:
+            run_bot()
+        except KeyboardInterrupt:
+            print("\nBot stopped manually.")
+            break
+        except Exception as e:
+            print("\nBOT CRASHED - restarting soon...")
+            print(f"Crash reason: {e}")
+            traceback.print_exc()
+            time.sleep(30)
