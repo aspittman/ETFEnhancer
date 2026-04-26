@@ -1,7 +1,13 @@
-#add API 
-#and Secret here
+import os
+from dotenv import load_dotenv
 
-DOLLARS_PER_TRADE = 500
+load_dotenv()
+
+API_KEY = os.getenv("PAPER_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALPACA_PAPER = os.getenv("PAPER_API_KEY", "true").lower() == "true"
+
+DOLLARS_PER_TRADE = 20
 MAX_POSITIONS = 5
 MAX_TOTAL_CAPITAL = 2500
 

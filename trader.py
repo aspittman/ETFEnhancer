@@ -3,7 +3,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.common.exceptions import APIError
 from strategy import wait_for_market_open
-from config import API_KEY, SECRET_KEY
+from config import API_KEY, SECRET_KEY, ALPACA_PAPER
 
 highest_price = {}
 
@@ -18,6 +18,22 @@ def get_total_market_value():
         print(f"Error getting total market value: {e}")
         return 0.0
 
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
+
+def has_open_order(symbol):
+    try:
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        orders = trading_client.get_orders(filter=request)
+
+        for order in orders:
+            if order.symbol == symbol:
+                return True
+
+    except Exception as e:
+        print(f"Error checking open orders: {e}")
+
+    return False
 
 def already_holding(symbol):
     return get_position(symbol) > 0
@@ -90,8 +106,12 @@ def check_stop_loss(symbol, stop_loss_percent):
 
     return False
 
-def place_trade(symbol, side, qty):
+def place_trade(symbol, side, qty=None, notional=None, reason="signal"):
     current_position = get_position(symbol)
+
+    if has_open_order(symbol):
+        print(f"Open order exists for {symbol}. Skipping...")
+        return
 
     if side == "buy" and current_position > 0:
         print("Already holding position. Skipping buy.")
@@ -101,15 +121,32 @@ def place_trade(symbol, side, qty):
         print("No shares to sell. Skipping sell.")
         return
 
-    order = MarketOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-        time_in_force=TimeInForce.DAY
-    )
+    if side == "buy":
+        order = MarketOrderRequest(
+            symbol=symbol,
+            notional=notional,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY
+        )
 
-    trading_client.submit_order(order)
-    print(f"Placed {side.upper()} order for {qty} shares of {symbol}")
+    else:
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY
+        )
+
+    try:
+        trading_client.submit_order(order)
+
+        if side == "buy":
+            print(f"Placed BUY order for ${notional} of {symbol}")
+        else:
+            print(f"Placed SELL order for {qty} shares of {symbol}")
+
+    except Exception as e:
+        print(f"Order failed: {e}")
 
 def print_account_info():
     account = trading_client.get_account()

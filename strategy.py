@@ -1,5 +1,19 @@
 import yfinance as yf
 import ta
+import time
+
+def wait_for_market_open(trading_client):
+    print("Checking if market is open...")
+
+    while True:
+        clock = trading_client.get_clock()
+
+        if clock.is_open:
+            print("Market is OPEN! Starting strategy...")
+            break
+        else:
+            print("Market closed. Waiting 60 seconds...")
+            time.sleep(60)
 
 def check_signal(symbol, ma_short, ma_long, macd_fast, macd_slow, macd_signal):
     try:

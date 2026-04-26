@@ -8,7 +8,6 @@ from trader import (
     get_total_market_value,
     already_holding,
     trading_client,
-    calculate_qty
 )
 
 from strategy import scan_universe, wait_for_market_open
@@ -87,14 +86,7 @@ def run_bot():
                 print(f"Already holding {symbol}. Skipping.")
                 continue
 
-            qty = calculate_qty(symbol, DOLLARS_PER_TRADE)
-
-            if qty <= 0:
-                print(f"Calculated qty for {symbol} is 0. Skipping.")
-                continue
-
-            print(f"Buying {qty} shares of {symbol} at about ${price:.2f}")
-            place_trade(symbol, "buy", qty)
+            place_trade(symbol, "buy", notional=DOLLARS_PER_TRADE)
             time.sleep(3)
 
             open_positions = get_open_positions_count()
