@@ -1,5 +1,10 @@
-#add API 
-#and Secret here
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("PAPER_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY")
 
 DOLLARS_PER_TRADE = 500
 MAX_POSITIONS = 5

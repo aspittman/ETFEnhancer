@@ -9,6 +9,29 @@ highest_price = {}
 
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
+def calculate_qty(symbol, dollars_per_trade):
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestQuoteRequest
+        from config import API_KEY, SECRET_KEY
+
+        data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+        request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        quote = data_client.get_stock_latest_quote(request)
+
+        ask_price = float(quote[symbol].ask_price)
+
+        if ask_price <= 0:
+            print(f"Invalid ask price for {symbol}")
+            return 0
+
+        qty = int(dollars_per_trade // ask_price)
+        return max(qty, 0)
+
+    except Exception as e:
+        print(f"Error calculating qty for {symbol}: {e}")
+        return 0
+    
 def get_total_market_value():
     try:
         positions = trading_client.get_all_positions()
