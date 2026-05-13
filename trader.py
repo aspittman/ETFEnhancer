@@ -4,10 +4,46 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.common.exceptions import APIError
 from strategy import wait_for_market_open
 from config import API_KEY, SECRET_KEY, ALPACA_PAPER
+import csv
+import os
+from datetime import datetime
 
 highest_price = {}
 
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+LOG_FILE = "logs/trades.csv"
+
+def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=None, pnl=None):
+    file_exists = os.path.isfile(LOG_FILE)
+
+    with open(LOG_FILE, mode="a", newline="") as file:
+        writer = csv.writer(file)
+
+        if not file_exists:
+            writer.writerow([
+                "timestamp",
+                "symbol",
+                "side",
+                "qty",
+                "price",
+                "reason",
+                "entry_price",
+                "exit_price",
+                "pnl"
+            ])
+
+        writer.writerow([
+            datetime.now(),
+            symbol,
+            side,
+            qty,
+            price,
+            reason,
+            entry_price,
+            exit_price,
+            pnl
+        ])
+        
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 
 def get_total_market_value():
     try:
@@ -64,9 +100,23 @@ def check_trailing_stop(symbol, trailing_percent):
 
         if current_price <= trail_stop_price:
             print("TRAILING STOP TRIGGERED!")
-            place_trade(symbol, "sell", int(position.qty))
 
-            # Reset after selling
+            qty = float(position.qty)
+            pnl = (current_price - entry_price) * qty
+
+            log_trade(
+                symbol=symbol,
+                side="sell",
+                qty=qty,
+                price=current_price,
+                reason="trailing_stop",
+                entry_price=entry_price,
+                exit_price=current_price,
+                pnl=pnl
+            )
+
+            place_trade(symbol, "sell", qty=qty, reason="trailing_stop")
+
             highest_price.pop(symbol, None)
 
             return True
@@ -79,7 +129,7 @@ def check_trailing_stop(symbol, trailing_percent):
 def get_position(symbol):
     try:
         position = trading_client.get_open_position(symbol)
-        return int(position.qty)
+        return float(position.qty)
     except APIError:
         return 0
 
@@ -98,7 +148,22 @@ def check_stop_loss(symbol, stop_loss_percent):
 
         if current_price <= loss_threshold:
             print("STOP LOSS TRIGGERED!")
-            place_trade(symbol, "sell", int(position.qty))
+
+            qty = float(position.qty)
+            pnl = (current_price - entry_price) * qty
+
+            log_trade(
+                symbol=symbol,
+                side="sell",
+                qty=qty,
+                price=current_price,
+                reason="stop_loss",
+                entry_price=entry_price,
+                exit_price=current_price,
+                pnl=pnl
+            )
+
+            place_trade(symbol, "sell", qty=qty, reason="stop_loss")
             return True
 
     except:
@@ -106,7 +171,7 @@ def check_stop_loss(symbol, stop_loss_percent):
 
     return False
 
-def place_trade(symbol, side, qty=None, notional=None, reason="signal"):
+def place_trade(symbol, side, qty=None, notional=5, reason="signal"):
     current_position = get_position(symbol)
 
     if has_open_order(symbol):
@@ -142,6 +207,26 @@ def place_trade(symbol, side, qty=None, notional=None, reason="signal"):
 
         if side == "buy":
             print(f"Placed BUY order for ${notional} of {symbol}")
+
+            try:
+                position = trading_client.get_open_position(symbol)
+                entry_price = float(position.avg_entry_price)
+                qty = float(position.qty)
+            except:
+                entry_price = None
+                qty = None
+
+            log_trade(
+                symbol=symbol,
+                side="buy",
+                qty=qty,
+                price=entry_price,
+                reason=reason,
+                entry_price=entry_price,
+                exit_price=None,
+                pnl=None
+            )
+
         else:
             print(f"Placed SELL order for {qty} shares of {symbol}")
 

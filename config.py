@@ -3,13 +3,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.getenv("PAPER_API_KEY")
+API_KEY = os.getenv("API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
-ALPACA_PAPER = os.getenv("PAPER_API_KEY", "true").lower() == "true"
+#ALPACA_PAPER = os.getenv("PAPER_API_KEY", "true").lower() == "true"
 
-DOLLARS_PER_TRADE = 20
-MAX_POSITIONS = 5
-MAX_TOTAL_CAPITAL = 2500
+DOLLARS_PER_TRADE = 5
+MAX_POSITIONS = 20
+MAX_TOTAL_CAPITAL = 100
 
 STOP_LOSS_PERCENT = 0.05
 TRAILING_STOP_PERCENT = 0.04
