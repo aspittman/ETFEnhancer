@@ -5,7 +5,7 @@ load_dotenv()
 
 API_KEY = os.getenv("API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
-#ALPACA_PAPER = os.getenv("PAPER_API_KEY", "true").lower() == "true"
+ALPACA_PAPER = os.getenv("PAPER_API_KEY", "true").lower() == "true"
 
 DOLLARS_PER_TRADE = 5
 MAX_POSITIONS = 20
