@@ -12,6 +12,7 @@ from trader import (
 
 from strategy import scan_universe, wait_for_market_open
 from universe import UNIVERSE
+from trader import is_in_cooldown
 
 from config import (
     DOLLARS_PER_TRADE,
@@ -86,6 +87,9 @@ def run_bot():
                 print(f"Already holding {symbol}. Skipping.")
                 continue
 
+            if is_in_cooldown(symbol):
+                continue
+            
             place_trade(symbol, "buy", notional=DOLLARS_PER_TRADE)
             time.sleep(3)
 

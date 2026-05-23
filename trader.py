@@ -6,11 +6,32 @@ from strategy import wait_for_market_open
 from config import API_KEY, SECRET_KEY, ALPACA_PAPER
 import csv
 import os
+import time
 from datetime import datetime
 
 highest_price = {}
+recently_sold = {}
 
+COOLDOWN_SECONDS = 3600  # 1 hour
 LOG_FILE = "logs/trades.csv"
+
+def mark_recently_sold(symbol):
+    recently_sold[symbol] = time.time()
+
+
+def is_in_cooldown(symbol):
+    if symbol not in recently_sold:
+        return False
+
+    elapsed = time.time() - recently_sold[symbol]
+
+    if elapsed < COOLDOWN_SECONDS:
+        remaining = int((COOLDOWN_SECONDS - elapsed) / 60)
+        print(f"{symbol} is cooling down for {remaining} more minutes.")
+        return True
+
+    recently_sold.pop(symbol, None)
+    return False
 
 def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=None, pnl=None):
     file_exists = os.path.isfile(LOG_FILE)
@@ -79,6 +100,10 @@ def get_open_positions_count():
     return len(positions)
 
 def check_trailing_stop(symbol, trailing_percent):
+    if has_open_order(symbol):
+        print(f"Sell order already pending for {symbol}")
+        return True
+    
     try:
         position = trading_client.get_open_position(symbol)
 
@@ -116,7 +141,7 @@ def check_trailing_stop(symbol, trailing_percent):
             )
 
             place_trade(symbol, "sell", qty=qty, reason="trailing_stop")
-
+            mark_recently_sold(symbol)
             highest_price.pop(symbol, None)
 
             return True
@@ -134,6 +159,10 @@ def get_position(symbol):
         return 0
 
 def check_stop_loss(symbol, stop_loss_percent):
+    if has_open_order(symbol):
+        print(f"Sell order already pending for {symbol}")
+        return True
+    
     try:
         position = trading_client.get_open_position(symbol)
 
@@ -164,6 +193,7 @@ def check_stop_loss(symbol, stop_loss_percent):
             )
 
             place_trade(symbol, "sell", qty=qty, reason="stop_loss")
+            mark_recently_sold(symbol)
             return True
 
     except:
@@ -171,7 +201,7 @@ def check_stop_loss(symbol, stop_loss_percent):
 
     return False
 
-def place_trade(symbol, side, qty=None, notional=5, reason="signal"):
+def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
     current_position = get_position(symbol)
 
     if has_open_order(symbol):
