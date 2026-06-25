@@ -3,14 +3,14 @@ from trader import (
     print_account_info,
     print_position,
     check_stop_loss,
-    check_trailing_stop,
+    check_atr_trailing_stop,
     get_open_positions_count,
     get_total_market_value,
     already_holding,
     trading_client,
 )
 
-from strategy import scan_universe, wait_for_market_open
+from strategy import get_market_regime, scan_universe, wait_for_market_open
 from universe import UNIVERSE
 from trader import is_in_cooldown
 
@@ -19,14 +19,21 @@ from config import (
     MAX_POSITIONS,
     MAX_TOTAL_CAPITAL,
     STOP_LOSS_PERCENT,
-    TRAILING_STOP_PERCENT,
+    ATR_TRAILING_MULTIPLIER,
+    ATR_WINDOW,
     MA_SHORT,
     MA_LONG,
     MACD_FAST,
     MACD_SLOW,
     MACD_SIGNAL,
     SCAN_INTERVAL_SECONDS,
-    MAX_CANDIDATES_PER_CYCLE
+    MAX_CANDIDATES_PER_CYCLE,
+    MARKET_REGIME_SYMBOL,
+    MARKET_REGIME_MA_SHORT,
+    MARKET_REGIME_MA_LONG,
+    MIN_CANDIDATE_SCORE,
+    MAX_BUYS_PER_CYCLE,
+    BLOCKED_SYMBOLS,
 )
 
 import time
@@ -47,7 +54,7 @@ def run_bot():
         for symbol in UNIVERSE:
             try:
                 stop_triggered = check_stop_loss(symbol, STOP_LOSS_PERCENT)
-                trailing_triggered = check_trailing_stop(symbol, TRAILING_STOP_PERCENT)
+                trailing_triggered = check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
 
                 if already_holding(symbol):
                     print_position(symbol)
@@ -57,23 +64,50 @@ def run_bot():
 
         # Scan for new entries
         print("\n=== SCANNING FOR NEW ENTRIES ===")
+        regime = get_market_regime(
+            MARKET_REGIME_SYMBOL,
+            MARKET_REGIME_MA_SHORT,
+            MARKET_REGIME_MA_LONG,
+        )
+        print(f"Market regime: {regime}")
+        if not regime["is_healthy"]:
+            print("Market regime is weak. Skipping new buys this cycle.")
+            print_account_info()
+            time.sleep(SCAN_INTERVAL_SECONDS)
+            continue
+
         candidates = scan_universe(
             UNIVERSE,
             MA_SHORT,
             MA_LONG,
             MACD_FAST,
             MACD_SLOW,
-            MACD_SIGNAL
+            MACD_SIGNAL,
+            ATR_WINDOW,
+            MIN_CANDIDATE_SCORE,
+            BLOCKED_SYMBOLS,
         )
 
         print(f"Found {len(candidates)} candidates.")
+        for rank, candidate in enumerate(candidates[:MAX_CANDIDATES_PER_CYCLE], start=1):
+            print(
+                f"#{rank} {candidate['symbol']} "
+                f"score={candidate['score']:.2f} "
+                f"price={candidate['price']:.2f} "
+                f"atr={candidate['atr']:.2f}"
+            )
 
         open_positions = get_open_positions_count()
         total_capital_used = get_total_market_value()
+        buys_this_cycle = 0
 
         for candidate in candidates[:MAX_CANDIDATES_PER_CYCLE]:
             symbol = candidate["symbol"]
             price = candidate["price"]
+
+            if buys_this_cycle >= MAX_BUYS_PER_CYCLE:
+                print("Max buys for this cycle reached.")
+                break
 
             if open_positions >= MAX_POSITIONS:
                 print("Max positions reached.")
@@ -91,6 +125,7 @@ def run_bot():
                 continue
             
             place_trade(symbol, "buy", notional=DOLLARS_PER_TRADE)
+            buys_this_cycle += 1
             time.sleep(3)
 
             open_positions = get_open_positions_count()

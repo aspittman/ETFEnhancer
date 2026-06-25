@@ -2,8 +2,19 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.common.exceptions import APIError
-from strategy import wait_for_market_open
-from config import API_KEY, SECRET_KEY, ALPACA_PAPER
+from strategy import build_strategy_frame, fetch_price_history, wait_for_market_open
+from config import (
+    API_KEY,
+    SECRET_KEY,
+    ALPACA_PAPER,
+    ATR_WINDOW,
+    MA_SHORT,
+    MA_LONG,
+    MACD_FAST,
+    MACD_SLOW,
+    MACD_SIGNAL,
+    ATR_TRAILING_MULTIPLIER,
+)
 import csv
 import os
 import time
@@ -99,7 +110,31 @@ def get_open_positions_count():
     positions = trading_client.get_all_positions()
     return len(positions)
 
-def check_trailing_stop(symbol, trailing_percent):
+def get_latest_atr(symbol):
+    data = fetch_price_history(symbol, period="1y", interval="1h")
+    if data.empty:
+        return None
+
+    frame = build_strategy_frame(
+        data,
+        MA_SHORT,
+        MA_LONG,
+        MACD_FAST,
+        MACD_SLOW,
+        MACD_SIGNAL,
+        ATR_WINDOW,
+    )
+    if frame.empty or "atr" not in frame.columns:
+        return None
+
+    latest_atr = frame["atr"].dropna()
+    if latest_atr.empty:
+        return None
+
+    return float(latest_atr.iloc[-1])
+
+
+def check_atr_trailing_stop(symbol, atr_multiplier):
     if has_open_order(symbol):
         print(f"Sell order already pending for {symbol}")
         return True
@@ -118,13 +153,19 @@ def check_trailing_stop(symbol, trailing_percent):
         if current_price > highest_price[symbol]:
             highest_price[symbol] = current_price
 
-        trail_stop_price = highest_price[symbol] * (1 - trailing_percent)
+        latest_atr = get_latest_atr(symbol)
+        if latest_atr is None or latest_atr <= 0:
+            print(f"ATR unavailable for {symbol}. Skipping ATR trailing stop.")
+            return False
+
+        trail_stop_price = highest_price[symbol] - (latest_atr * atr_multiplier)
 
         print(f"Highest Price: {highest_price[symbol]}")
-        print(f"Trailing Stop Price: {trail_stop_price}")
+        print(f"ATR: {latest_atr}")
+        print(f"ATR Trailing Stop Price: {trail_stop_price}")
 
         if current_price <= trail_stop_price:
-            print("TRAILING STOP TRIGGERED!")
+            print("ATR TRAILING STOP TRIGGERED!")
 
             qty = float(position.qty)
             pnl = (current_price - entry_price) * qty
@@ -134,13 +175,13 @@ def check_trailing_stop(symbol, trailing_percent):
                 side="sell",
                 qty=qty,
                 price=current_price,
-                reason="trailing_stop",
+                reason="atr_trailing_stop",
                 entry_price=entry_price,
                 exit_price=current_price,
                 pnl=pnl
             )
 
-            place_trade(symbol, "sell", qty=qty, reason="trailing_stop")
+            place_trade(symbol, "sell", qty=qty, reason="atr_trailing_stop")
             mark_recently_sold(symbol)
             highest_price.pop(symbol, None)
 
@@ -150,6 +191,11 @@ def check_trailing_stop(symbol, trailing_percent):
         return False
 
     return False
+
+
+def check_trailing_stop(symbol, trailing_percent):
+    print("Fixed percent trailing stops are deprecated; using ATR trailing stop.")
+    return check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
 
 def get_position(symbol):
     try:
