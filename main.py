@@ -10,7 +10,7 @@ from trader import (
     trading_client,
 )
 
-from strategy import get_market_regime, scan_universe, wait_for_market_open
+from strategy import StrategySwitches, get_market_regime, scan_universe, wait_for_market_open
 from universe import UNIVERSE
 from trader import is_in_cooldown
 
@@ -34,6 +34,16 @@ from config import (
     MIN_CANDIDATE_SCORE,
     MAX_BUYS_PER_CYCLE,
     BLOCKED_SYMBOLS,
+    ENABLE_ATR_TRAILING_STOP,
+    ENABLE_ATR_TREND_FILTER,
+    ENABLE_FIXED_STOP_LOSS,
+    ENABLE_MACD_FILTER,
+    ENABLE_MARKET_REGIME_FILTER,
+    ENABLE_MA_ALIGNMENT_FILTER,
+    ENABLE_MIN_SCORE_FILTER,
+    ENABLE_RELATIVE_STRENGTH_FILTER,
+    ENABLE_TOP_CANDIDATE_SELECTION,
+    ENABLE_VOLUME_FILTER,
 )
 
 import time
@@ -43,6 +53,16 @@ import traceback
 def run_bot():
     wait_for_market_open(trading_client)
     print("Starting trend scanner bot...")
+    switches = StrategySwitches(
+        market_regime=ENABLE_MARKET_REGIME_FILTER,
+        ma_alignment=ENABLE_MA_ALIGNMENT_FILTER,
+        macd=ENABLE_MACD_FILTER,
+        relative_strength=ENABLE_RELATIVE_STRENGTH_FILTER,
+        volume=ENABLE_VOLUME_FILTER,
+        atr_trend_quality=ENABLE_ATR_TREND_FILTER,
+        min_score=ENABLE_MIN_SCORE_FILTER,
+        top_candidates=ENABLE_TOP_CANDIDATE_SELECTION,
+    )
 
     while True:
         print("\n==============================")
@@ -53,8 +73,10 @@ def run_bot():
         print("\n=== MANAGING OPEN POSITIONS ===")
         for symbol in UNIVERSE:
             try:
-                stop_triggered = check_stop_loss(symbol, STOP_LOSS_PERCENT)
-                trailing_triggered = check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
+                if ENABLE_FIXED_STOP_LOSS:
+                    check_stop_loss(symbol, STOP_LOSS_PERCENT)
+                if ENABLE_ATR_TRAILING_STOP:
+                    check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
 
                 if already_holding(symbol):
                     print_position(symbol)
@@ -64,17 +86,18 @@ def run_bot():
 
         # Scan for new entries
         print("\n=== SCANNING FOR NEW ENTRIES ===")
-        regime = get_market_regime(
-            MARKET_REGIME_SYMBOL,
-            MARKET_REGIME_MA_SHORT,
-            MARKET_REGIME_MA_LONG,
-        )
-        print(f"Market regime: {regime}")
-        if not regime["is_healthy"]:
-            print("Market regime is weak. Skipping new buys this cycle.")
-            print_account_info()
-            time.sleep(SCAN_INTERVAL_SECONDS)
-            continue
+        if switches.market_regime:
+            regime = get_market_regime(
+                MARKET_REGIME_SYMBOL,
+                MARKET_REGIME_MA_SHORT,
+                MARKET_REGIME_MA_LONG,
+            )
+            print(f"Market regime: {regime}")
+            if not regime["is_healthy"]:
+                print("Market regime is weak. Skipping new buys this cycle.")
+                print_account_info()
+                time.sleep(SCAN_INTERVAL_SECONDS)
+                continue
 
         candidates = scan_universe(
             UNIVERSE,
@@ -85,7 +108,10 @@ def run_bot():
             MACD_SIGNAL,
             ATR_WINDOW,
             MIN_CANDIDATE_SCORE,
+            MAX_CANDIDATES_PER_CYCLE,
             BLOCKED_SYMBOLS,
+            MARKET_REGIME_SYMBOL,
+            switches,
         )
 
         print(f"Found {len(candidates)} candidates.")

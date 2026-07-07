@@ -1,8 +1,21 @@
 import time
+from dataclasses import dataclass
 
 import pandas as pd
 import ta
 import yfinance as yf
+
+
+@dataclass
+class StrategySwitches:
+    market_regime: bool = True
+    ma_alignment: bool = True
+    macd: bool = True
+    relative_strength: bool = True
+    volume: bool = True
+    atr_trend_quality: bool = True
+    min_score: bool = True
+    top_candidates: bool = True
 
 
 def wait_for_market_open(trading_client):
@@ -37,11 +50,12 @@ def normalize_price_data(data):
     if missing:
         return pd.DataFrame()
 
-    clean = data[required].copy()
-    for column in required:
+    columns = required + (["Volume"] if "Volume" in data.columns else [])
+    clean = data[columns].copy()
+    for column in columns:
         clean[column] = pd.to_numeric(clean[column], errors="coerce")
 
-    return clean.dropna()
+    return clean.dropna(subset=required)
 
 
 def build_strategy_frame(
@@ -52,6 +66,9 @@ def build_strategy_frame(
     macd_slow,
     macd_signal,
     atr_window=14,
+    benchmark_frame=None,
+    relative_strength_window=63,
+    switches=None,
 ):
     clean = normalize_price_data(data)
     if clean.empty:
@@ -82,6 +99,9 @@ def build_strategy_frame(
     )
     frame["atr"] = atr.average_true_range()
     frame["atr_percent"] = frame["atr"] / close * 100
+    frame["volume_20"] = (
+        frame["Volume"].rolling(window=20).mean() if "Volume" in frame.columns else pd.NA
+    )
 
     frame["in_uptrend"] = (close > frame["ma_short"]) & (
         frame["ma_short"] > frame["ma_long"]
@@ -94,39 +114,105 @@ def build_strategy_frame(
         frame["in_uptrend"] & frame["ma_rising"] & frame["macd_confirmed"]
     )
 
-    trend_score = (close - frame["ma_short"]) / frame["ma_short"] * 100
-    structure_score = (
-        (frame["ma_short"] - frame["ma_long"]) / frame["ma_long"] * 100
-    )
-    momentum_score = frame["macd_hist"]
-    volatility_penalty = frame["atr_percent"].clip(lower=0) * 0.15
-    frame["score"] = trend_score + structure_score + momentum_score - volatility_penalty
+    frame = apply_relative_strength(frame, benchmark_frame, relative_strength_window)
+    return score_strategy_frame(frame, switches)
+
+
+def apply_relative_strength(frame, benchmark_frame=None, window=63):
+    frame = frame.copy()
+    stock_return = frame["Close"].pct_change(window) * 100
+    frame["relative_strength"] = 0.0
+
+    if benchmark_frame is not None and not benchmark_frame.empty:
+        benchmark = normalize_price_data(benchmark_frame)
+        if not benchmark.empty:
+            benchmark_return = benchmark["Close"].pct_change(window) * 100
+            benchmark_return = benchmark_return.reindex(frame.index, method="ffill")
+            frame["relative_strength"] = stock_return - benchmark_return
+
+    frame["relative_strength"] = pd.to_numeric(
+        frame["relative_strength"], errors="coerce"
+    ).fillna(0.0)
 
     return frame
 
 
-def signal_from_row(symbol, row):
+def score_strategy_frame(frame, switches=None):
+    switches = switches or StrategySwitches()
+    frame = frame.copy()
+
+    frame["ma_alignment_score"] = (
+        ((frame["Close"] - frame["ma_short"]) / frame["ma_short"] * 100)
+        + ((frame["ma_short"] - frame["ma_long"]) / frame["ma_long"] * 100)
+    )
+    frame["macd_hist_score"] = frame["macd_hist"] / frame["Close"] * 100
+    frame["relative_strength_score"] = frame["relative_strength"]
+    if "Volume" in frame.columns:
+        frame["volume_score"] = ((frame["Volume"] / frame["volume_20"]) - 1) * 10
+    else:
+        frame["volume_score"] = 0.0
+    frame["atr_trend_quality_score"] = (
+        (frame["ma_short"] - frame["ma_long"]) / frame["atr"]
+    ).clip(lower=-5, upper=5)
+
+    score = pd.Series(0.0, index=frame.index)
+    if switches.ma_alignment:
+        score = score + frame["ma_alignment_score"]
+    if switches.macd:
+        score = score + frame["macd_hist_score"]
+    if switches.relative_strength:
+        score = score + frame["relative_strength_score"]
+    if switches.volume:
+        score = score + frame["volume_score"]
+    if switches.atr_trend_quality:
+        score = score + frame["atr_trend_quality_score"]
+
+    frame["score"] = pd.to_numeric(score, errors="coerce").fillna(0.0)
+    return frame
+
+
+def signal_from_row(symbol, row, switches=None):
+    switches = switches or StrategySwitches()
     values = [
         row.get("Close"),
         row.get("ma_short"),
         row.get("ma_long"),
         row.get("prev_ma_short"),
-        row.get("macd"),
-        row.get("macd_signal"),
-        row.get("macd_hist"),
         row.get("score"),
         row.get("atr"),
     ]
+    if switches.macd:
+        values.extend([row.get("macd"), row.get("macd_signal"), row.get("macd_hist")])
+    if switches.relative_strength:
+        values.append(row.get("relative_strength"))
+    if switches.volume:
+        values.append(row.get("volume_score"))
+    if switches.atr_trend_quality:
+        values.append(row.get("atr_trend_quality_score"))
+
     if any(pd.isna(value) for value in values):
         return None
 
-    if not bool(row.get("signal")):
+    passes_filters = True
+    if switches.ma_alignment:
+        passes_filters = passes_filters and bool(row.get("in_uptrend")) and bool(
+            row.get("ma_rising")
+        )
+    if switches.macd:
+        passes_filters = passes_filters and bool(row.get("macd_confirmed"))
+    if not passes_filters:
         return None
 
     return {
         "symbol": symbol,
         "price": float(row["Close"]),
         "score": float(row["score"]),
+        "ma_alignment_score": float(row["ma_alignment_score"]),
+        "macd_hist_score": float(row["macd_hist_score"]),
+        "relative_strength": float(row["relative_strength"]),
+        "relative_strength_score": float(row["relative_strength_score"]),
+        "volume_score": float(row["volume_score"]),
+        "atr_trend_quality_score": float(row["atr_trend_quality_score"]),
         "ma_short": float(row["ma_short"]),
         "ma_long": float(row["ma_long"]),
         "macd": float(row["macd"]),
@@ -147,6 +233,8 @@ def check_signal(
     atr_window=14,
     period="1y",
     interval="1h",
+    benchmark_frame=None,
+    switches=None,
 ):
     try:
         data = fetch_price_history(symbol, period=period, interval=interval)
@@ -162,11 +250,13 @@ def check_signal(
             macd_slow,
             macd_signal,
             atr_window,
+            benchmark_frame,
+            switches=switches,
         )
         if frame.empty:
             return None
 
-        return signal_from_row(symbol, frame.iloc[-1])
+        return signal_from_row(symbol, frame.iloc[-1], switches)
 
     except Exception as e:
         print(f"Error checking {symbol}: {e}")
@@ -202,11 +292,7 @@ def get_market_regime(
         if any(pd.isna(value) for value in values):
             return {"symbol": symbol, "is_healthy": False, "reason": "nan_values"}
 
-        is_healthy = (
-            latest_close > latest_short
-            and latest_short > latest_long
-            and latest_short >= previous_short
-        )
+        is_healthy = latest_close > latest_long and latest_short > latest_long
 
         return {
             "symbol": symbol,
@@ -231,10 +317,19 @@ def scan_universe(
     macd_signal,
     atr_window=14,
     min_score=None,
+    max_candidates=None,
     blocked_symbols=None,
+    market_regime_symbol="SPY",
+    switches=None,
 ):
     candidates = []
     blocked = set(blocked_symbols or [])
+    switches = switches or StrategySwitches()
+    benchmark_frame = None
+    if switches.relative_strength:
+        benchmark_frame = fetch_price_history(
+            market_regime_symbol, period="1y", interval="1h"
+        )
 
     for symbol in universe:
         if symbol in blocked:
@@ -250,10 +345,21 @@ def scan_universe(
             macd_slow,
             macd_signal,
             atr_window,
+            benchmark_frame=benchmark_frame,
+            switches=switches,
         )
 
-        if result and (min_score is None or result["score"] >= min_score):
+        if not result:
+            continue
+
+        passes_score = (
+            min_score is None or not switches.min_score or result["score"] >= min_score
+        )
+        if passes_score:
             candidates.append(result)
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    if switches.top_candidates:
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        if max_candidates is not None:
+            return candidates[:max_candidates]
     return candidates

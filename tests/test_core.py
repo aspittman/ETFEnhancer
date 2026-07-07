@@ -41,6 +41,49 @@ class StrategyTests(unittest.TestCase):
 
         self.assertFalse(_market_is_healthy(frame.index[-1], frame))
 
+    def test_market_regime_uses_price_above_200_and_50_above_200(self):
+        frame = pd.DataFrame(
+            {
+                "Close": [105.0],
+                "ma_short": [101.0],
+                "ma_long": [100.0],
+                "prev_ma_short": [99.0],
+            },
+            index=pd.to_datetime(["2026-06-25"]),
+        )
+
+        self.assertTrue(_market_is_healthy(frame.index[-1], frame))
+
+    def test_relative_strength_contributes_to_candidate_score(self):
+        index = pd.date_range("2026-01-01", periods=260, freq="h")
+        close = pd.Series(range(100, 360), index=index, dtype=float)
+        benchmark_close = pd.Series(list(range(100, 230)) + [229.0] * 130, index=index)
+        data = pd.DataFrame(
+            {
+                "Open": close - 0.5,
+                "High": close + 1.0,
+                "Low": close - 1.0,
+                "Close": close,
+                "Volume": [1000.0] * len(index),
+            }
+        )
+        benchmark = pd.DataFrame(
+            {
+                "Open": benchmark_close - 0.5,
+                "High": benchmark_close + 1.0,
+                "Low": benchmark_close - 1.0,
+                "Close": benchmark_close,
+                "Volume": [1000.0] * len(index),
+            }
+        )
+
+        frame = build_strategy_frame(data, 20, 50, 12, 26, 9, 14, benchmark)
+        signal = signal_from_row("TEST", frame.iloc[-1])
+
+        self.assertIsNotNone(signal)
+        self.assertGreater(signal["relative_strength"], 0)
+        self.assertIn("volume_score", signal)
+
 
 class AnalyticsTests(unittest.TestCase):
     def test_summarize_closed_trades_calculates_expectancy_and_symbols(self):

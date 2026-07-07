@@ -9,6 +9,16 @@ from config import (
     ATR_WINDOW,
     BLOCKED_SYMBOLS,
     DOLLARS_PER_TRADE,
+    ENABLE_ATR_TRAILING_STOP,
+    ENABLE_ATR_TREND_FILTER,
+    ENABLE_FIXED_STOP_LOSS,
+    ENABLE_MACD_FILTER,
+    ENABLE_MARKET_REGIME_FILTER,
+    ENABLE_MA_ALIGNMENT_FILTER,
+    ENABLE_MIN_SCORE_FILTER,
+    ENABLE_RELATIVE_STRENGTH_FILTER,
+    ENABLE_TOP_CANDIDATE_SELECTION,
+    ENABLE_VOLUME_FILTER,
     MACD_FAST,
     MACD_SIGNAL,
     MACD_SLOW,
@@ -20,7 +30,13 @@ from config import (
     MIN_CANDIDATE_SCORE,
     STOP_LOSS_PERCENT,
 )
-from strategy import build_strategy_frame, fetch_price_history, signal_from_row
+from strategy import (
+    StrategySwitches,
+    build_strategy_frame,
+    fetch_price_history,
+    score_strategy_frame,
+    signal_from_row,
+)
 from universe import UNIVERSE
 
 
@@ -35,13 +51,51 @@ class BacktestConfig:
     atr_multiplier: float = ATR_TRAILING_MULTIPLIER
     atr_window: int = ATR_WINDOW
     min_candidate_score: float = MIN_CANDIDATE_SCORE
+    enable_market_regime_filter: bool = ENABLE_MARKET_REGIME_FILTER
+    enable_ma_alignment_filter: bool = ENABLE_MA_ALIGNMENT_FILTER
+    enable_macd_filter: bool = ENABLE_MACD_FILTER
+    enable_relative_strength_filter: bool = ENABLE_RELATIVE_STRENGTH_FILTER
+    enable_volume_filter: bool = ENABLE_VOLUME_FILTER
+    enable_atr_trend_filter: bool = ENABLE_ATR_TREND_FILTER
+    enable_min_score_filter: bool = ENABLE_MIN_SCORE_FILTER
+    enable_top_candidate_selection: bool = ENABLE_TOP_CANDIDATE_SELECTION
+    enable_atr_trailing_stop: bool = ENABLE_ATR_TRAILING_STOP
+    enable_fixed_stop_loss: bool = ENABLE_FIXED_STOP_LOSS
+
+    def switches(self):
+        return StrategySwitches(
+            market_regime=self.enable_market_regime_filter,
+            ma_alignment=self.enable_ma_alignment_filter,
+            macd=self.enable_macd_filter,
+            relative_strength=self.enable_relative_strength_filter,
+            volume=self.enable_volume_filter,
+            atr_trend_quality=self.enable_atr_trend_filter,
+            min_score=self.enable_min_score_filter,
+            top_candidates=self.enable_top_candidate_selection,
+        )
 
 
-def run_backtest(symbols=None, config=None, blocked_symbols=None):
+def run_backtest(symbols=None, config=None, blocked_symbols=None, prepared=None):
     config = config or BacktestConfig()
     symbols = list(symbols or UNIVERSE)
     blocked = set(blocked_symbols if blocked_symbols is not None else BLOCKED_SYMBOLS)
 
+    if prepared is None:
+        frames, benchmark = _prepare_frames(symbols, config, blocked)
+    else:
+        frames, benchmark = prepared
+
+    frames = {
+        symbol: score_strategy_frame(frame, config.switches())
+        for symbol, frame in frames.items()
+    }
+    if benchmark is not None and not benchmark.empty:
+        benchmark = score_strategy_frame(benchmark, config.switches())
+
+    return _simulate_backtest(frames, benchmark, config)
+
+
+def _prepare_frames(symbols, config, blocked):
     frames = {}
     for symbol in symbols:
         if symbol in blocked:
@@ -61,17 +115,14 @@ def run_backtest(symbols=None, config=None, blocked_symbols=None):
         if not frame.empty:
             frames[symbol] = frame
 
-    if not frames:
-        return {"trades": [], "summary": summarize_closed_trades([])}
-
-    benchmark = frames.get(MARKET_REGIME_SYMBOL)
-    if benchmark is None:
+    relative_strength_benchmark = frames.get(MARKET_REGIME_SYMBOL)
+    if relative_strength_benchmark is None:
         data = fetch_price_history(
             MARKET_REGIME_SYMBOL,
             period=config.period,
             interval=config.interval,
         )
-        benchmark = build_strategy_frame(
+        relative_strength_benchmark = build_strategy_frame(
             data,
             MA_SHORT,
             MA_LONG,
@@ -81,6 +132,36 @@ def run_backtest(symbols=None, config=None, blocked_symbols=None):
             config.atr_window,
         )
 
+    regime_data = fetch_price_history(MARKET_REGIME_SYMBOL, period=config.period, interval="1d")
+    regime_benchmark = build_strategy_frame(
+        regime_data,
+        MA_SHORT,
+        MA_LONG,
+        MACD_FAST,
+        MACD_SLOW,
+        MACD_SIGNAL,
+        config.atr_window,
+    )
+
+    for symbol, frame in list(frames.items()):
+        frames[symbol] = build_strategy_frame(
+            frame,
+            MA_SHORT,
+            MA_LONG,
+            MACD_FAST,
+            MACD_SLOW,
+            MACD_SIGNAL,
+            config.atr_window,
+            benchmark_frame=relative_strength_benchmark,
+        )
+
+    return frames, regime_benchmark
+
+
+def _simulate_backtest(frames, benchmark, config):
+    if not frames:
+        return {"trades": [], "summary": summarize_closed_trades([])}
+
     calendar = sorted(set().union(*(frame.index for frame in frames.values())))
     positions = {}
     closed_trades = []
@@ -88,7 +169,7 @@ def run_backtest(symbols=None, config=None, blocked_symbols=None):
     for timestamp in calendar:
         _manage_positions(timestamp, frames, positions, closed_trades, config)
 
-        if not _market_is_healthy(timestamp, benchmark):
+        if config.enable_market_regime_filter and not _market_is_healthy(timestamp, benchmark):
             continue
 
         candidates = _rank_candidates(timestamp, frames, positions, config)
@@ -149,11 +230,11 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
         stop_price = position["entry_price"] * (1 - config.stop_loss_percent)
         atr = row.get("atr")
         trail_price = None
-        if not pd.isna(atr) and float(atr) > 0:
+        if config.enable_atr_trailing_stop and not pd.isna(atr) and float(atr) > 0:
             trail_price = position["highest_price"] - (float(atr) * config.atr_multiplier)
 
         low = float(row["Low"])
-        if low <= stop_price:
+        if config.enable_fixed_stop_loss and low <= stop_price:
             _close_position(
                 symbol,
                 positions,
@@ -179,11 +260,19 @@ def _rank_candidates(timestamp, frames, positions, config):
         if symbol in positions or timestamp not in frame.index:
             continue
 
-        signal = signal_from_row(symbol, frame.loc[timestamp])
-        if signal and signal["score"] >= config.min_candidate_score:
+        signal = signal_from_row(symbol, frame.loc[timestamp], config.switches())
+        if not signal:
+            continue
+
+        passes_score = (
+            not config.enable_min_score_filter
+            or signal["score"] >= config.min_candidate_score
+        )
+        if passes_score:
             candidates.append(signal)
 
-    candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+    if config.enable_top_candidate_selection:
+        candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
     return candidates
 
 
@@ -201,10 +290,84 @@ def _market_is_healthy(timestamp, benchmark):
         return False
 
     return (
-        float(row["Close"]) > float(row["ma_short"])
+        float(row["Close"]) > float(row["ma_long"])
         and float(row["ma_short"]) > float(row["ma_long"])
-        and float(row["ma_short"]) >= float(row["prev_ma_short"])
     )
+
+
+def measure_filter_impact(symbols=None, config=None, blocked_symbols=None):
+    config = config or BacktestConfig()
+    symbols = list(symbols or UNIVERSE)
+    blocked = set(blocked_symbols if blocked_symbols is not None else BLOCKED_SYMBOLS)
+    prepared = _prepare_frames(symbols, config, blocked)
+
+    baseline = run_backtest(
+        symbols=symbols,
+        config=config,
+        blocked_symbols=blocked,
+        prepared=prepared,
+    )["summary"]
+    rows = [{"filter": "baseline", **_impact_metrics(baseline)}]
+
+    toggles = [
+        ("market_regime", "enable_market_regime_filter"),
+        ("ma_alignment", "enable_ma_alignment_filter"),
+        ("macd", "enable_macd_filter"),
+        ("relative_strength", "enable_relative_strength_filter"),
+        ("volume", "enable_volume_filter"),
+        ("atr_trend_quality", "enable_atr_trend_filter"),
+        ("min_score", "enable_min_score_filter"),
+        ("top_candidate_selection", "enable_top_candidate_selection"),
+        ("atr_trailing_stop", "enable_atr_trailing_stop"),
+        ("fixed_stop_loss", "enable_fixed_stop_loss"),
+    ]
+    for name, field in toggles:
+        variant = BacktestConfig(**{**config.__dict__, field: not getattr(config, field)})
+        summary = run_backtest(
+            symbols=symbols,
+            config=variant,
+            blocked_symbols=blocked,
+            prepared=prepared,
+        )["summary"]
+        metrics = _impact_metrics(summary)
+        metrics["pnl_delta"] = metrics["total_pnl"] - baseline["total_pnl"]
+        metrics["expectancy_delta"] = metrics["expectancy"] - baseline["expectancy"]
+        metrics["win_rate_delta"] = metrics["win_rate"] - baseline["win_rate"]
+        metrics["profit_factor_delta"] = metrics["profit_factor"] - baseline["profit_factor"]
+        rows.append({"filter": f"{name}_{'off' if getattr(config, field) else 'on'}", **metrics})
+
+    return rows
+
+
+def _impact_metrics(summary):
+    return {
+        "total_pnl": summary["total_pnl"],
+        "expectancy": summary["expectancy"],
+        "win_rate": summary["win_rate"],
+        "profit_factor": summary["profit_factor"],
+        "total_trades": summary["total_trades"],
+    }
+
+
+def print_filter_impact(rows):
+    print("===== FILTER IMPACT =====")
+    print(
+        "filter,total_pnl,expectancy,win_rate,profit_factor,total_trades,"
+        "pnl_delta,expectancy_delta,win_rate_delta,profit_factor_delta"
+    )
+    for row in rows:
+        print(
+            f"{row['filter']},"
+            f"{row['total_pnl']:.2f},"
+            f"{row['expectancy']:.2f},"
+            f"{row['win_rate']:.2%},"
+            f"{row['profit_factor']:.2f},"
+            f"{row['total_trades']},"
+            f"{row.get('pnl_delta', 0.0):.2f},"
+            f"{row.get('expectancy_delta', 0.0):.2f},"
+            f"{row.get('win_rate_delta', 0.0):.2%},"
+            f"{row.get('profit_factor_delta', 0.0):.2f}"
+        )
 
 
 def _close_position(symbol, positions, closed_trades, timestamp, exit_price, reason):
@@ -241,17 +404,41 @@ if __name__ == "__main__":
     parser.add_argument("--max-positions", type=int, default=MAX_POSITIONS)
     parser.add_argument("--max-buys-per-bar", type=int, default=MAX_BUYS_PER_CYCLE)
     parser.add_argument("--min-score", type=float, default=MIN_CANDIDATE_SCORE)
+    parser.add_argument("--filter-impact", action="store_true")
+    parser.add_argument("--disable-market-regime", action="store_true")
+    parser.add_argument("--disable-ma-alignment", action="store_true")
+    parser.add_argument("--disable-macd", action="store_true")
+    parser.add_argument("--disable-relative-strength", action="store_true")
+    parser.add_argument("--disable-volume", action="store_true")
+    parser.add_argument("--disable-atr-trend", action="store_true")
+    parser.add_argument("--disable-min-score", action="store_true")
+    parser.add_argument("--disable-top-selection", action="store_true")
+    parser.add_argument("--disable-atr-trailing-stop", action="store_true")
+    parser.add_argument("--disable-fixed-stop-loss", action="store_true")
     args = parser.parse_args()
 
-    result = run_backtest(
-        symbols=_parse_symbols(args.symbols),
-        config=BacktestConfig(
-            period=args.period,
-            interval=args.interval,
-            dollars_per_trade=args.dollars_per_trade,
-            max_positions=args.max_positions,
-            max_buys_per_bar=args.max_buys_per_bar,
-            min_candidate_score=args.min_score,
-        ),
+    config = BacktestConfig(
+        period=args.period,
+        interval=args.interval,
+        dollars_per_trade=args.dollars_per_trade,
+        max_positions=args.max_positions,
+        max_buys_per_bar=args.max_buys_per_bar,
+        min_candidate_score=args.min_score,
+        enable_market_regime_filter=not args.disable_market_regime,
+        enable_ma_alignment_filter=not args.disable_ma_alignment,
+        enable_macd_filter=not args.disable_macd,
+        enable_relative_strength_filter=not args.disable_relative_strength,
+        enable_volume_filter=not args.disable_volume,
+        enable_atr_trend_filter=not args.disable_atr_trend,
+        enable_min_score_filter=not args.disable_min_score,
+        enable_top_candidate_selection=not args.disable_top_selection,
+        enable_atr_trailing_stop=not args.disable_atr_trailing_stop,
+        enable_fixed_stop_loss=not args.disable_fixed_stop_loss,
     )
-    print_summary(result["summary"])
+    symbols = _parse_symbols(args.symbols)
+
+    if args.filter_impact:
+        print_filter_impact(measure_filter_impact(symbols=symbols, config=config))
+    else:
+        result = run_backtest(symbols=symbols, config=config)
+        print_summary(result["summary"])
