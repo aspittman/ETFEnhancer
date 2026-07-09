@@ -12,6 +12,7 @@ class StrategySwitches:
     ma_alignment: bool = True
     macd: bool = True
     relative_strength: bool = True
+    price_momentum: bool = True
     volume: bool = True
     atr_trend_quality: bool = True
     min_score: bool = True
@@ -52,6 +53,9 @@ def normalize_price_data(data):
 
     columns = required + (["Volume"] if "Volume" in data.columns else [])
     clean = data[columns].copy()
+    if isinstance(clean.index, pd.DatetimeIndex) and clean.index.tz is not None:
+        clean.index = clean.index.tz_localize(None)
+
     for column in columns:
         clean[column] = pd.to_numeric(clean[column], errors="coerce")
 
@@ -110,6 +114,7 @@ def build_strategy_frame(
     frame["macd_confirmed"] = (frame["macd"] > frame["macd_signal"]) & (
         frame["macd_hist"] > 0
     )
+    frame["price_momentum_score"] = close.pct_change(20) * 100
     frame["signal"] = (
         frame["in_uptrend"] & frame["ma_rising"] & frame["macd_confirmed"]
     )
@@ -147,6 +152,8 @@ def score_strategy_frame(frame, switches=None):
     )
     frame["macd_hist_score"] = frame["macd_hist"] / frame["Close"] * 100
     frame["relative_strength_score"] = frame["relative_strength"]
+    if "price_momentum_score" not in frame.columns:
+        frame["price_momentum_score"] = frame["Close"].pct_change(20) * 100
     if "Volume" in frame.columns:
         frame["volume_score"] = ((frame["Volume"] / frame["volume_20"]) - 1) * 10
     else:
@@ -162,6 +169,8 @@ def score_strategy_frame(frame, switches=None):
         score = score + frame["macd_hist_score"]
     if switches.relative_strength:
         score = score + frame["relative_strength_score"]
+    if switches.price_momentum:
+        score = score + frame["price_momentum_score"]
     if switches.volume:
         score = score + frame["volume_score"]
     if switches.atr_trend_quality:
@@ -185,6 +194,8 @@ def signal_from_row(symbol, row, switches=None):
         values.extend([row.get("macd"), row.get("macd_signal"), row.get("macd_hist")])
     if switches.relative_strength:
         values.append(row.get("relative_strength"))
+    if switches.price_momentum:
+        values.append(row.get("price_momentum_score"))
     if switches.volume:
         values.append(row.get("volume_score"))
     if switches.atr_trend_quality:
@@ -211,6 +222,7 @@ def signal_from_row(symbol, row, switches=None):
         "macd_hist_score": float(row["macd_hist_score"]),
         "relative_strength": float(row["relative_strength"]),
         "relative_strength_score": float(row["relative_strength_score"]),
+        "price_momentum_score": float(row["price_momentum_score"]),
         "volume_score": float(row["volume_score"]),
         "atr_trend_quality_score": float(row["atr_trend_quality_score"]),
         "ma_short": float(row["ma_short"]),

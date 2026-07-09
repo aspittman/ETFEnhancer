@@ -8,6 +8,8 @@ from trader import (
     get_total_market_value,
     already_holding,
     trading_client,
+    validate_alpaca_credentials,
+    AlpacaAuthError,
 )
 
 from strategy import StrategySwitches, get_market_regime, scan_universe, wait_for_market_open
@@ -32,7 +34,7 @@ from config import (
     MARKET_REGIME_MA_SHORT,
     MARKET_REGIME_MA_LONG,
     MIN_CANDIDATE_SCORE,
-    MAX_BUYS_PER_CYCLE,
+    MAX_NEW_BUYS_PER_CYCLE,
     BLOCKED_SYMBOLS,
     ENABLE_ATR_TRAILING_STOP,
     ENABLE_ATR_TREND_FILTER,
@@ -40,6 +42,7 @@ from config import (
     ENABLE_MACD_FILTER,
     ENABLE_MARKET_REGIME_FILTER,
     ENABLE_MA_ALIGNMENT_FILTER,
+    ENABLE_MOMENTUM_SCORE,
     ENABLE_MIN_SCORE_FILTER,
     ENABLE_RELATIVE_STRENGTH_FILTER,
     ENABLE_TOP_CANDIDATE_SELECTION,
@@ -51,6 +54,7 @@ import traceback
 
 
 def run_bot():
+    validate_alpaca_credentials()
     wait_for_market_open(trading_client)
     print("Starting trend scanner bot...")
     switches = StrategySwitches(
@@ -58,9 +62,10 @@ def run_bot():
         ma_alignment=ENABLE_MA_ALIGNMENT_FILTER,
         macd=ENABLE_MACD_FILTER,
         relative_strength=ENABLE_RELATIVE_STRENGTH_FILTER,
+        price_momentum=ENABLE_MOMENTUM_SCORE,
         volume=ENABLE_VOLUME_FILTER,
         atr_trend_quality=ENABLE_ATR_TREND_FILTER,
-        min_score=ENABLE_MIN_SCORE_FILTER,
+        min_score=ENABLE_MIN_SCORE_FILTER and MIN_CANDIDATE_SCORE is not None,
         top_candidates=ENABLE_TOP_CANDIDATE_SELECTION,
     )
 
@@ -82,6 +87,8 @@ def run_bot():
                     print_position(symbol)
 
             except Exception as e:
+                if isinstance(e, AlpacaAuthError):
+                    raise
                 print(f"Error managing {symbol}: {e}")
 
         # Scan for new entries
@@ -131,7 +138,7 @@ def run_bot():
             symbol = candidate["symbol"]
             price = candidate["price"]
 
-            if buys_this_cycle >= MAX_BUYS_PER_CYCLE:
+            if buys_this_cycle >= MAX_NEW_BUYS_PER_CYCLE:
                 print("Max buys for this cycle reached.")
                 break
 
@@ -167,6 +174,10 @@ if __name__ == "__main__":
             run_bot()
         except KeyboardInterrupt:
             print("\nBot stopped manually.")
+            break
+        except AlpacaAuthError as e:
+            print("\nBOT STOPPED - Alpaca authentication failed.")
+            print(e)
             break
         except Exception as e:
             print("\nBOT CRASHED - restarting soon...")

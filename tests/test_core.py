@@ -4,7 +4,7 @@ import pandas as pd
 
 from analytics import pair_live_trade_log, summarize_closed_trades
 from backtest import BacktestConfig, _market_is_healthy
-from strategy import build_strategy_frame, signal_from_row
+from strategy import build_strategy_frame, normalize_price_data, signal_from_row
 
 
 class StrategyTests(unittest.TestCase):
@@ -53,6 +53,41 @@ class StrategyTests(unittest.TestCase):
         )
 
         self.assertTrue(_market_is_healthy(frame.index[-1], frame))
+
+    def test_market_regime_accepts_timezone_aware_timestamp(self):
+        frame = pd.DataFrame(
+            {
+                "Close": [105.0],
+                "ma_short": [101.0],
+                "ma_long": [100.0],
+                "prev_ma_short": [99.0],
+            },
+            index=pd.to_datetime(["2026-06-25"]),
+        )
+        timestamp = pd.Timestamp("2026-06-25 09:30:00", tz="America/New_York")
+
+        self.assertTrue(_market_is_healthy(timestamp, frame))
+
+    def test_normalize_price_data_removes_index_timezone(self):
+        index = pd.date_range(
+            "2026-06-25 09:30:00",
+            periods=2,
+            freq="h",
+            tz="America/New_York",
+        )
+        data = pd.DataFrame(
+            {
+                "Open": [100.0, 101.0],
+                "High": [101.0, 102.0],
+                "Low": [99.0, 100.0],
+                "Close": [100.5, 101.5],
+            },
+            index=index,
+        )
+
+        clean = normalize_price_data(data)
+
+        self.assertIsNone(clean.index.tz)
 
     def test_relative_strength_contributes_to_candidate_score(self):
         index = pd.date_range("2026-01-01", periods=260, freq="h")

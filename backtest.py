@@ -15,6 +15,7 @@ from config import (
     ENABLE_MACD_FILTER,
     ENABLE_MARKET_REGIME_FILTER,
     ENABLE_MA_ALIGNMENT_FILTER,
+    ENABLE_MOMENTUM_SCORE,
     ENABLE_MIN_SCORE_FILTER,
     ENABLE_RELATIVE_STRENGTH_FILTER,
     ENABLE_TOP_CANDIDATE_SELECTION,
@@ -25,6 +26,7 @@ from config import (
     MARKET_REGIME_SYMBOL,
     MAX_BUYS_PER_CYCLE,
     MAX_POSITIONS,
+    MAX_TOTAL_CAPITAL,
     MA_LONG,
     MA_SHORT,
     MIN_CANDIDATE_SCORE,
@@ -37,7 +39,7 @@ from strategy import (
     score_strategy_frame,
     signal_from_row,
 )
-from universe import UNIVERSE
+from universe import COMBINED_UNIVERSE, ETF_UNIVERSE, STOCK_UNIVERSE, UNIVERSE
 
 
 @dataclass
@@ -46,15 +48,17 @@ class BacktestConfig:
     interval: str = "1h"
     dollars_per_trade: float = DOLLARS_PER_TRADE
     max_positions: int = MAX_POSITIONS
+    max_total_capital: float = MAX_TOTAL_CAPITAL
     max_buys_per_bar: int = MAX_BUYS_PER_CYCLE
     stop_loss_percent: float = STOP_LOSS_PERCENT
     atr_multiplier: float = ATR_TRAILING_MULTIPLIER
     atr_window: int = ATR_WINDOW
-    min_candidate_score: float = MIN_CANDIDATE_SCORE
+    min_candidate_score: float | None = MIN_CANDIDATE_SCORE
     enable_market_regime_filter: bool = ENABLE_MARKET_REGIME_FILTER
     enable_ma_alignment_filter: bool = ENABLE_MA_ALIGNMENT_FILTER
     enable_macd_filter: bool = ENABLE_MACD_FILTER
     enable_relative_strength_filter: bool = ENABLE_RELATIVE_STRENGTH_FILTER
+    enable_momentum_score: bool = ENABLE_MOMENTUM_SCORE
     enable_volume_filter: bool = ENABLE_VOLUME_FILTER
     enable_atr_trend_filter: bool = ENABLE_ATR_TREND_FILTER
     enable_min_score_filter: bool = ENABLE_MIN_SCORE_FILTER
@@ -68,9 +72,11 @@ class BacktestConfig:
             ma_alignment=self.enable_ma_alignment_filter,
             macd=self.enable_macd_filter,
             relative_strength=self.enable_relative_strength_filter,
+            price_momentum=self.enable_momentum_score,
             volume=self.enable_volume_filter,
             atr_trend_quality=self.enable_atr_trend_filter,
-            min_score=self.enable_min_score_filter,
+            min_score=self.enable_min_score_filter
+            and self.min_candidate_score is not None,
             top_candidates=self.enable_top_candidate_selection,
         )
 
@@ -179,6 +185,8 @@ def _simulate_backtest(frames, benchmark, config):
                 break
             if buys >= config.max_buys_per_bar:
                 break
+            if _capital_in_use(positions) + config.dollars_per_trade > config.max_total_capital:
+                break
 
             symbol = candidate["symbol"]
             price = candidate["price"]
@@ -266,6 +274,7 @@ def _rank_candidates(timestamp, frames, positions, config):
 
         passes_score = (
             not config.enable_min_score_filter
+            or config.min_candidate_score is None
             or signal["score"] >= config.min_candidate_score
         )
         if passes_score:
@@ -276,9 +285,25 @@ def _rank_candidates(timestamp, frames, positions, config):
     return candidates
 
 
+def _capital_in_use(positions):
+    return sum(
+        position["entry_price"] * position["qty"]
+        for position in positions.values()
+    )
+
+
 def _market_is_healthy(timestamp, benchmark):
     if benchmark is None or benchmark.empty:
         return False
+
+    if isinstance(benchmark.index, pd.DatetimeIndex):
+        timestamp = pd.Timestamp(timestamp)
+        if benchmark.index.tz is None and timestamp.tz is not None:
+            timestamp = timestamp.tz_localize(None)
+        elif benchmark.index.tz is not None and timestamp.tz is None:
+            timestamp = timestamp.tz_localize(benchmark.index.tz)
+        elif benchmark.index.tz is not None and timestamp.tz is not None:
+            timestamp = timestamp.tz_convert(benchmark.index.tz)
 
     available = benchmark.index[benchmark.index <= timestamp]
     if len(available) == 0:
@@ -395,13 +420,39 @@ def _parse_symbols(value):
     return [symbol.strip().upper() for symbol in value.split(",") if symbol.strip()]
 
 
+def _symbols_for_universe(name):
+    universes = {
+        "etf": ETF_UNIVERSE,
+        "stock": STOCK_UNIVERSE,
+        "combined": COMBINED_UNIVERSE,
+    }
+    return list(universes[name])
+
+
+def _run_and_print_report(label, symbols, config, filter_impact=False):
+    print(f"\n===== {label.upper()} BACKTEST =====")
+    if filter_impact:
+        print_filter_impact(measure_filter_impact(symbols=symbols, config=config))
+        return
+
+    result = run_backtest(symbols=symbols, config=config)
+    print_summary(result["summary"])
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run an offline strategy backtest.")
     parser.add_argument("--symbols", help="Comma-separated symbols. Defaults to universe.py.")
+    parser.add_argument(
+        "--universe",
+        choices=["etf", "stock", "combined", "all"],
+        default="etf",
+        help="Backtest ETF-only, stock-only, combined, or all reports.",
+    )
     parser.add_argument("--period", default="1y")
     parser.add_argument("--interval", default="1h")
     parser.add_argument("--dollars-per-trade", type=float, default=DOLLARS_PER_TRADE)
     parser.add_argument("--max-positions", type=int, default=MAX_POSITIONS)
+    parser.add_argument("--max-total-capital", type=float, default=MAX_TOTAL_CAPITAL)
     parser.add_argument("--max-buys-per-bar", type=int, default=MAX_BUYS_PER_CYCLE)
     parser.add_argument("--min-score", type=float, default=MIN_CANDIDATE_SCORE)
     parser.add_argument("--filter-impact", action="store_true")
@@ -422,6 +473,7 @@ if __name__ == "__main__":
         interval=args.interval,
         dollars_per_trade=args.dollars_per_trade,
         max_positions=args.max_positions,
+        max_total_capital=args.max_total_capital,
         max_buys_per_bar=args.max_buys_per_bar,
         min_candidate_score=args.min_score,
         enable_market_regime_filter=not args.disable_market_regime,
@@ -435,10 +487,22 @@ if __name__ == "__main__":
         enable_atr_trailing_stop=not args.disable_atr_trailing_stop,
         enable_fixed_stop_loss=not args.disable_fixed_stop_loss,
     )
-    symbols = _parse_symbols(args.symbols)
 
-    if args.filter_impact:
-        print_filter_impact(measure_filter_impact(symbols=symbols, config=config))
+    if args.symbols:
+        symbols = _parse_symbols(args.symbols)
+        _run_and_print_report("custom", symbols, config, args.filter_impact)
+    elif args.universe == "all":
+        for universe_name in ("etf", "stock", "combined"):
+            _run_and_print_report(
+                universe_name,
+                _symbols_for_universe(universe_name),
+                config,
+                args.filter_impact,
+            )
     else:
-        result = run_backtest(symbols=symbols, config=config)
-        print_summary(result["summary"])
+        _run_and_print_report(
+            args.universe,
+            _symbols_for_universe(args.universe),
+            config,
+            args.filter_impact,
+        )

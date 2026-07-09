@@ -26,6 +26,45 @@ recently_sold = {}
 COOLDOWN_SECONDS = 3600  # 1 hour
 LOG_FILE = "logs/trades.csv"
 
+
+class AlpacaAuthError(RuntimeError):
+    pass
+
+
+def is_alpaca_unauthorized(error):
+    message = str(error).lower()
+    return "401" in message or "unauthorized" in message or "not authorized" in message
+
+
+def raise_if_alpaca_unauthorized(error, action):
+    if is_alpaca_unauthorized(error):
+        environment = "paper" if ALPACA_PAPER else "live"
+        raise AlpacaAuthError(
+            f"Alpaca rejected credentials while trying to {action}. "
+            f"Check that API_KEY and SECRET_KEY are valid {environment} keys and "
+            "that ALPACA_PAPER matches the key type."
+        ) from error
+
+
+def validate_alpaca_credentials():
+    missing = [
+        name
+        for name, value in (("API_KEY", API_KEY), ("SECRET_KEY", SECRET_KEY))
+        if not value
+    ]
+    if missing:
+        raise AlpacaAuthError(
+            "Missing Alpaca credential environment variables: "
+            + ", ".join(missing)
+            + ". Add them to .env before starting the bot."
+        )
+
+    try:
+        trading_client.get_account()
+    except Exception as e:
+        raise_if_alpaca_unauthorized(e, "validate the trading account")
+        raise
+
 def mark_recently_sold(symbol):
     recently_sold[symbol] = time.time()
 
@@ -99,6 +138,7 @@ def has_open_order(symbol):
                 return True
 
     except Exception as e:
+        raise_if_alpaca_unauthorized(e, "check open orders")
         print(f"Error checking open orders: {e}")
 
     return False
@@ -107,8 +147,12 @@ def already_holding(symbol):
     return get_position(symbol) > 0
 
 def get_open_positions_count():
-    positions = trading_client.get_all_positions()
-    return len(positions)
+    try:
+        positions = trading_client.get_all_positions()
+        return len(positions)
+    except Exception as e:
+        raise_if_alpaca_unauthorized(e, "count open positions")
+        raise
 
 def get_latest_atr(symbol):
     data = fetch_price_history(symbol, period="1y", interval="1h")
@@ -187,7 +231,8 @@ def check_atr_trailing_stop(symbol, atr_multiplier):
 
             return True
 
-    except:
+    except Exception as e:
+        raise_if_alpaca_unauthorized(e, f"check ATR trailing stop for {symbol}")
         return False
 
     return False
@@ -201,7 +246,8 @@ def get_position(symbol):
     try:
         position = trading_client.get_open_position(symbol)
         return float(position.qty)
-    except APIError:
+    except APIError as e:
+        raise_if_alpaca_unauthorized(e, f"get the {symbol} position")
         return 0
 
 def check_stop_loss(symbol, stop_loss_percent):
@@ -242,7 +288,8 @@ def check_stop_loss(symbol, stop_loss_percent):
             mark_recently_sold(symbol)
             return True
 
-    except:
+    except Exception as e:
+        raise_if_alpaca_unauthorized(e, f"check stop loss for {symbol}")
         return False
 
     return False

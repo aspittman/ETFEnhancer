@@ -14,6 +14,7 @@ def summarize_closed_trades(trades):
             "average_win": 0.0,
             "average_loss": 0.0,
             "profit_factor": 0.0,
+            "max_drawdown": 0.0,
             "best_symbol": None,
             "worst_symbol": None,
             "by_symbol": {},
@@ -42,6 +43,9 @@ def summarize_closed_trades(trades):
         key=lambda item: item[1]["total_pnl"],
         reverse=True,
     )
+    ordered = df.sort_values("exit_time") if "exit_time" in df.columns else df
+    equity = ordered["pnl"].cumsum()
+    drawdown = equity - equity.cummax()
 
     return {
         "total_trades": int(len(df)),
@@ -51,6 +55,7 @@ def summarize_closed_trades(trades):
         "average_win": float(wins["pnl"].mean()) if not wins.empty else 0.0,
         "average_loss": float(losses["pnl"].mean()) if not losses.empty else 0.0,
         "profit_factor": gross_profit / gross_loss if gross_loss > 0 else 0.0,
+        "max_drawdown": abs(float(drawdown.min())) if not drawdown.empty else 0.0,
         "best_symbol": ranked_symbols[0][0] if ranked_symbols else None,
         "worst_symbol": ranked_symbols[-1][0] if ranked_symbols else None,
         "by_symbol": by_symbol,
@@ -112,6 +117,7 @@ def print_summary(summary):
     print(f"Average win: ${summary['average_win']:.2f}")
     print(f"Average loss: ${summary['average_loss']:.2f}")
     print(f"Profit factor: {summary['profit_factor']:.2f}")
+    print(f"Max drawdown: ${summary.get('max_drawdown', 0.0):.2f}")
     print(f"Best symbol: {summary['best_symbol']}")
     print(f"Worst symbol: {summary['worst_symbol']}")
     print("\nBy symbol:")
