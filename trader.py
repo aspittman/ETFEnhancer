@@ -19,12 +19,15 @@ import csv
 import os
 import time
 from datetime import datetime
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
 
 highest_price = {}
 recently_sold = {}
 
 COOLDOWN_SECONDS = 3600  # 1 hour
 LOG_FILE = "logs/trades.csv"
+ALPACA_READ_RETRIES = 3
+ALPACA_RETRY_DELAY_SECONDS = 2
 
 
 class AlpacaAuthError(RuntimeError):
@@ -46,6 +49,28 @@ def raise_if_alpaca_unauthorized(error, action):
         ) from error
 
 
+def is_transient_alpaca_error(error):
+    return isinstance(error, (RequestsConnectionError, Timeout))
+
+
+def alpaca_read(call, action, retries=ALPACA_READ_RETRIES):
+    """Run an idempotent Alpaca read with bounded connection retries."""
+    for attempt in range(1, retries + 1):
+        try:
+            return call()
+        except Exception as error:
+            raise_if_alpaca_unauthorized(error, action)
+            if not is_transient_alpaca_error(error) or attempt == retries:
+                raise
+
+            delay = ALPACA_RETRY_DELAY_SECONDS * attempt
+            print(
+                f"Alpaca connection error while trying to {action} "
+                f"(attempt {attempt}/{retries}). Retrying in {delay}s: {error}"
+            )
+            time.sleep(delay)
+
+
 def validate_alpaca_credentials():
     missing = [
         name
@@ -60,7 +85,7 @@ def validate_alpaca_credentials():
         )
 
     try:
-        trading_client.get_account()
+        alpaca_read(trading_client.get_account, "validate the trading account")
     except Exception as e:
         raise_if_alpaca_unauthorized(e, "validate the trading account")
         raise
@@ -117,13 +142,10 @@ def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=Non
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 
 def get_total_market_value():
-    try:
-        positions = trading_client.get_all_positions()
-        total = sum(float(p.market_value) for p in positions)
-        return total
-    except Exception as e:
-        print(f"Error getting total market value: {e}")
-        return 0.0
+    positions = alpaca_read(
+        trading_client.get_all_positions, "calculate total market value"
+    )
+    return sum(float(p.market_value) for p in positions)
 
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
@@ -131,7 +153,9 @@ from alpaca.trading.enums import QueryOrderStatus
 def has_open_order(symbol):
     try:
         request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-        orders = trading_client.get_orders(filter=request)
+        orders = alpaca_read(
+            lambda: trading_client.get_orders(filter=request), "check open orders"
+        )
 
         for order in orders:
             if order.symbol == symbol:
@@ -139,6 +163,8 @@ def has_open_order(symbol):
 
     except Exception as e:
         raise_if_alpaca_unauthorized(e, "check open orders")
+        if is_transient_alpaca_error(e):
+            raise
         print(f"Error checking open orders: {e}")
 
     return False
@@ -147,12 +173,8 @@ def already_holding(symbol):
     return get_position(symbol) > 0
 
 def get_open_positions_count():
-    try:
-        positions = trading_client.get_all_positions()
-        return len(positions)
-    except Exception as e:
-        raise_if_alpaca_unauthorized(e, "count open positions")
-        raise
+    positions = alpaca_read(trading_client.get_all_positions, "count open positions")
+    return len(positions)
 
 def get_latest_atr(symbol):
     data = fetch_price_history(symbol, period="1y", interval="1h")
@@ -357,7 +379,7 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
         print(f"Order failed: {e}")
 
 def print_account_info():
-    account = trading_client.get_account()
+    account = alpaca_read(trading_client.get_account, "get account information")
 
     print("\n===== ACCOUNT INFO =====")
     print(f"Equity: ${account.equity}")
