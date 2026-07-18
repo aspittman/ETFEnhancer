@@ -1,16 +1,19 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 import pandas as pd
 
-from analytics import pair_live_trade_log, summarize_closed_trades
+from analytics import load_live_trade_log, pair_live_trade_log, summarize_closed_trades
 from backtest import BacktestConfig, _market_is_healthy
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
+from trader import update_midpoint_state
 
 
 class StrategyTests(unittest.TestCase):
     def test_signal_from_row_returns_rankable_candidate(self):
         index = pd.date_range("2026-01-01", periods=260, freq="h")
-        close = pd.Series(range(100, 360), index=index, dtype=float)
+        close = pd.Series([100 + i * 0.1 for i in range(260)], index=index, dtype=float)
         data = pd.DataFrame(
             {
                 "Open": close - 0.5,
@@ -91,7 +94,7 @@ class StrategyTests(unittest.TestCase):
 
     def test_relative_strength_contributes_to_candidate_score(self):
         index = pd.date_range("2026-01-01", periods=260, freq="h")
-        close = pd.Series(range(100, 360), index=index, dtype=float)
+        close = pd.Series([100 + i * 0.1 for i in range(260)], index=index, dtype=float)
         benchmark_close = pd.Series(list(range(100, 230)) + [229.0] * 130, index=index)
         data = pd.DataFrame(
             {
@@ -121,6 +124,23 @@ class StrategyTests(unittest.TestCase):
 
 
 class AnalyticsTests(unittest.TestCase):
+    def test_load_live_trade_log_accepts_headerless_legacy_log(self):
+        contents = (
+            "2026-01-01,AAA,buy,2,10,signal,10,,\n"
+            "2026-01-02,AAA,sell,2,12,atr_trailing_stop,10,12,4\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades.csv"
+            path.write_text(contents)
+
+            rows = load_live_trade_log(path)
+            trades = pair_live_trade_log(rows)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["timestamp"], "2026-01-01")
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["pnl"], 4.0)
+
     def test_summarize_closed_trades_calculates_expectancy_and_symbols(self):
         summary = summarize_closed_trades(
             [
@@ -166,6 +186,20 @@ class BacktestConfigTests(unittest.TestCase):
     def test_backtest_config_uses_atr_multiplier(self):
         config = BacktestConfig(atr_multiplier=2.5)
         self.assertEqual(config.atr_multiplier, 2.5)
+
+    def test_midpoint_stop_only_moves_up(self):
+        state = {
+            "entry_price": 76.0,
+            "highest_price_since_entry": 76.0,
+            "current_midpoint_stop": 76.0,
+        }
+        update_midpoint_state(state, 76.0, 82.0)
+        self.assertEqual(state["current_midpoint_stop"], 79.0)
+        update_midpoint_state(state, 76.0, 78.0)
+        self.assertEqual(state["current_midpoint_stop"], 79.0)
+        update_midpoint_state(state, 76.0, 100.0)
+        self.assertEqual(state["previous_high"], 82.0)
+        self.assertEqual(state["current_midpoint_stop"], 91.0)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,21 @@
 import csv
 from collections import defaultdict
+from datetime import datetime
 
 import pandas as pd
+
+
+TRADE_LOG_FIELDS = [
+    "timestamp",
+    "symbol",
+    "side",
+    "qty",
+    "price",
+    "reason",
+    "entry_price",
+    "exit_price",
+    "pnl",
+]
 
 
 def summarize_closed_trades(trades):
@@ -13,6 +27,7 @@ def summarize_closed_trades(trades):
             "total_pnl": 0.0,
             "average_win": 0.0,
             "average_loss": 0.0,
+            "average_holding_period_hours": 0.0,
             "profit_factor": 0.0,
             "max_drawdown": 0.0,
             "best_symbol": None,
@@ -46,6 +61,8 @@ def summarize_closed_trades(trades):
     ordered = df.sort_values("exit_time") if "exit_time" in df.columns else df
     equity = ordered["pnl"].cumsum()
     drawdown = equity - equity.cummax()
+    holding_hours = [_holding_hours(row) for row in trades]
+    holding_hours = [hours for hours in holding_hours if hours is not None]
 
     return {
         "total_trades": int(len(df)),
@@ -54,6 +71,7 @@ def summarize_closed_trades(trades):
         "total_pnl": float(df["pnl"].sum()),
         "average_win": float(wins["pnl"].mean()) if not wins.empty else 0.0,
         "average_loss": float(losses["pnl"].mean()) if not losses.empty else 0.0,
+        "average_holding_period_hours": sum(holding_hours) / len(holding_hours) if holding_hours else 0.0,
         "profit_factor": gross_profit / gross_loss if gross_loss > 0 else 0.0,
         "max_drawdown": abs(float(drawdown.min())) if not drawdown.empty else 0.0,
         "best_symbol": ranked_symbols[0][0] if ranked_symbols else None,
@@ -64,7 +82,23 @@ def summarize_closed_trades(trades):
 
 def load_live_trade_log(path):
     with open(path, newline="") as file:
-        return list(csv.DictReader(file))
+        rows = list(csv.reader(file))
+
+    if not rows:
+        return []
+
+    # Older logs were created without a header when the file already existed.
+    # Detect that format instead of allowing DictReader to consume the first
+    # trade as field names.
+    first_row = [value.strip().lower() for value in rows[0]]
+    has_header = "timestamp" in first_row and "symbol" in first_row and "side" in first_row
+    data_rows = rows[1:] if has_header else rows
+
+    return [
+        dict(zip(TRADE_LOG_FIELDS, row + [""] * (len(TRADE_LOG_FIELDS) - len(row))))
+        for row in data_rows
+        if row
+    ]
 
 
 def pair_live_trade_log(rows):
@@ -116,6 +150,7 @@ def print_summary(summary):
     print(f"Total P/L: ${summary['total_pnl']:.2f}")
     print(f"Average win: ${summary['average_win']:.2f}")
     print(f"Average loss: ${summary['average_loss']:.2f}")
+    print(f"Average holding period: {summary['average_holding_period_hours']:.1f} hours")
     print(f"Profit factor: {summary['profit_factor']:.2f}")
     print(f"Max drawdown: ${summary.get('max_drawdown', 0.0):.2f}")
     print(f"Best symbol: {summary['best_symbol']}")
@@ -139,6 +174,15 @@ def _to_float(value):
         if value in (None, ""):
             return None
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _holding_hours(trade):
+    try:
+        start = datetime.fromisoformat(str(trade.get("entry_time")))
+        end = datetime.fromisoformat(str(trade.get("exit_time")))
+        return (end - start).total_seconds() / 3600
     except (TypeError, ValueError):
         return None
 

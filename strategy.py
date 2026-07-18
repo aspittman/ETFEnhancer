@@ -5,6 +5,8 @@ import pandas as pd
 import ta
 import yfinance as yf
 
+from config import PULLBACK_EMA_TOLERANCE, PULLBACK_LOOKBACK, PULLBACK_SMA_TOLERANCE
+
 
 @dataclass
 class StrategySwitches:
@@ -17,6 +19,7 @@ class StrategySwitches:
     atr_trend_quality: bool = True
     min_score: bool = True
     top_candidates: bool = True
+    bullish_candle: bool = False
 
 
 def wait_for_market_open(trading_client):
@@ -73,6 +76,9 @@ def build_strategy_frame(
     benchmark_frame=None,
     relative_strength_window=63,
     switches=None,
+    pullback_lookback=PULLBACK_LOOKBACK,
+    pullback_ema_tolerance=PULLBACK_EMA_TOLERANCE,
+    pullback_sma_tolerance=PULLBACK_SMA_TOLERANCE,
 ):
     clean = normalize_price_data(data)
     if clean.empty:
@@ -83,6 +89,7 @@ def build_strategy_frame(
 
     frame["ma_short"] = close.rolling(window=ma_short).mean()
     frame["ma_long"] = close.rolling(window=ma_long).mean()
+    frame["ema_20"] = close.ewm(span=20, adjust=False).mean()
     frame["prev_ma_short"] = frame["ma_short"].shift(1)
 
     macd = ta.trend.MACD(
@@ -107,17 +114,24 @@ def build_strategy_frame(
         frame["Volume"].rolling(window=20).mean() if "Volume" in frame.columns else pd.NA
     )
 
-    frame["in_uptrend"] = (close > frame["ma_short"]) & (
-        frame["ma_short"] > frame["ma_long"]
-    )
+    frame["in_uptrend"] = (close > frame["ma_long"]) & (frame["ma_short"] > frame["ma_long"])
     frame["ma_rising"] = frame["ma_short"] > frame["prev_ma_short"]
+    frame["ema_aligned"] = frame["ema_20"] > frame["ma_short"]
     frame["macd_confirmed"] = (frame["macd"] > frame["macd_signal"]) & (
         frame["macd_hist"] > 0
     )
     frame["price_momentum_score"] = close.pct_change(20) * 100
-    frame["signal"] = (
-        frame["in_uptrend"] & frame["ma_rising"] & frame["macd_confirmed"]
+    pullback_touch = (
+        (frame["Low"] <= frame["ema_20"] * (1 + pullback_ema_tolerance))
+        & (frame["Low"] >= frame["ma_short"] * (1 - pullback_sma_tolerance))
     )
+    frame["controlled_pullback"] = (
+        pullback_touch.rolling(pullback_lookback).max().fillna(False).astype(bool)
+        & (close <= frame["ema_20"] * 1.03)
+    )
+    frame["momentum_recovering"] = (close > close.shift(1)) & (close > frame["ema_20"])
+    frame["bullish_candle"] = close > frame["Open"]
+    frame["signal"] = frame["in_uptrend"] & frame["ma_rising"] & frame["ema_aligned"] & frame["controlled_pullback"] & frame["momentum_recovering"]
 
     frame = apply_relative_strength(frame, benchmark_frame, relative_strength_window)
     return score_strategy_frame(frame, switches)
@@ -189,6 +203,7 @@ def signal_from_row(symbol, row, switches=None):
         row.get("prev_ma_short"),
         row.get("score"),
         row.get("atr"),
+        row.get("ema_20"),
     ]
     if switches.macd:
         values.extend([row.get("macd"), row.get("macd_signal"), row.get("macd_hist")])
@@ -208,9 +223,14 @@ def signal_from_row(symbol, row, switches=None):
     if switches.ma_alignment:
         passes_filters = passes_filters and bool(row.get("in_uptrend")) and bool(
             row.get("ma_rising")
-        )
+        ) and bool(row.get("ema_aligned"))
+    passes_filters = passes_filters and bool(row.get("controlled_pullback")) and bool(
+        row.get("momentum_recovering")
+    )
     if switches.macd:
         passes_filters = passes_filters and bool(row.get("macd_confirmed"))
+    if switches.bullish_candle:
+        passes_filters = passes_filters and bool(row.get("bullish_candle"))
     if not passes_filters:
         return None
 
@@ -227,6 +247,7 @@ def signal_from_row(symbol, row, switches=None):
         "atr_trend_quality_score": float(row["atr_trend_quality_score"]),
         "ma_short": float(row["ma_short"]),
         "ma_long": float(row["ma_long"]),
+        "ema_20": float(row["ema_20"]),
         "macd": float(row["macd"]),
         "macd_signal": float(row["macd_signal"]),
         "macd_hist": float(row["macd_hist"]),

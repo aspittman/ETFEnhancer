@@ -34,16 +34,21 @@ Key risk and selection settings live in `config.py`:
 - `MIN_CANDIDATE_SCORE`: optional minimum ranked score. `None` disables the
   minimum-score gate.
 - `MAX_NEW_BUYS_PER_CYCLE`: maximum new buys per scan cycle.
-- `ATR_WINDOW` and `ATR_TRAILING_MULTIPLIER`: ATR trailing stop settings.
-  ATR trailing stops are available but disabled by default.
+- `HARD_STOP_PERCENT`: independent catastrophic stop, defaulting to 8%.
+- `ENABLE_DYNAMIC_MIDPOINT_STOP`: primary exit. Each new high raises a
+  persisted stop to the midpoint between the prior high-water mark and the new
+  high.
+- `ENABLE_ATR_STOP`: optional legacy ATR comparison exit, disabled by default.
+- `PULLBACK_LOOKBACK`, `PULLBACK_EMA_TOLERANCE`, and
+  `PULLBACK_SMA_TOLERANCE`: control what qualifies as a pullback.
 - `ENABLE_MARKET_REGIME_FILTER`, `ENABLE_MA_ALIGNMENT_FILTER`,
   `ENABLE_MACD_FILTER`, `ENABLE_RELATIVE_STRENGTH_SCORE`,
   `ENABLE_MOMENTUM_SCORE`, `ENABLE_VOLUME_FILTER`, `ENABLE_ATR_TREND_FILTER`,
   `ENABLE_MIN_SCORE_FILTER`, and `ENABLE_TOP_CANDIDATE_SELECTION`:
   independently enable or disable entry and ranking behavior. Volume, ATR trend,
   and minimum-score gates are disabled by default.
-- `ENABLE_ATR_TRAILING_STOP` and `ENABLE_FIXED_STOP_LOSS`: independently
-  enable or disable exit protection rules.
+- `ENABLE_EMA_EXIT` and `ENABLE_MACD_EXIT` are disabled; EMA and MACD weakness
+  do not close a live position.
 
 The bot still manages existing positions even when a symbol is blocked or the market
 regime is weak.
@@ -71,10 +76,14 @@ Useful options:
 python backtest.py --symbols SPY,QQQ,XLK --period 2y --interval 1h
 python backtest.py --min-score 3 --max-buys-per-bar 1
 python backtest.py --filter-impact --universe etf --period 2y
+python backtest.py --compare-exits --universe etf --period 2y
 ```
 
-The backtester uses the same entry signal, relative-strength scoring versus SPY,
-market regime filter, fixed stop loss, and optional ATR trailing stop logic as the live bot.
+The backtester uses the same pullback entry, relative-strength scoring versus SPY,
+market regime filter, emergency stop, and dynamic midpoint stop as the live bot.
+`--compare-exits` runs midpoint and ATR exits over one shared market-data set with
+identical entry rules and reports profit factor, expectancy, P/L, average winner,
+average loser, average holding period, win rate, drawdown, and trade count.
 `--filter-impact` prints total P/L, expectancy, win rate, profit factor, and deltas
 for each filter by toggling one switch at a time.
 

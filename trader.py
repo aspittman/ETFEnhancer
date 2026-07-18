@@ -16,6 +16,7 @@ from config import (
     ATR_TRAILING_MULTIPLIER,
 )
 import csv
+import json
 import os
 import time
 from datetime import datetime
@@ -23,15 +24,56 @@ from requests.exceptions import ConnectionError as RequestsConnectionError, Time
 
 highest_price = {}
 recently_sold = {}
+position_state = {}
 
 COOLDOWN_SECONDS = 3600  # 1 hour
 LOG_FILE = "logs/trades.csv"
+POSITION_STATE_FILE = "logs/position_state.json"
 ALPACA_READ_RETRIES = 3
 ALPACA_RETRY_DELAY_SECONDS = 2
 
 
 class AlpacaAuthError(RuntimeError):
     pass
+
+
+def load_position_state():
+    global position_state
+    try:
+        with open(POSITION_STATE_FILE) as file:
+            position_state = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        position_state = {}
+    return position_state
+
+
+def save_position_state():
+    os.makedirs(os.path.dirname(POSITION_STATE_FILE), exist_ok=True)
+    temporary = POSITION_STATE_FILE + ".tmp"
+    with open(temporary, "w") as file:
+        json.dump(position_state, file, indent=2, sort_keys=True)
+    os.replace(temporary, POSITION_STATE_FILE)
+
+
+load_position_state()
+
+
+def update_midpoint_state(state, entry_price, observed_price):
+    old_high = float(state.get("highest_price_since_entry", entry_price))
+    old_stop = float(state.get("current_midpoint_stop", entry_price))
+    state["entry_price"] = entry_price
+    state.setdefault("previous_high", old_high)
+    if observed_price > old_high:
+        state["previous_high"] = old_high
+        state["highest_price_since_entry"] = observed_price
+        state["current_midpoint_stop"] = max(
+            old_stop,
+            (old_high + observed_price) / 2,
+        )
+    else:
+        state["highest_price_since_entry"] = old_high
+        state["current_midpoint_stop"] = old_stop
+    return state
 
 
 def is_alpaca_unauthorized(error):
@@ -109,6 +151,7 @@ def is_in_cooldown(symbol):
     return False
 
 def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=None, pnl=None):
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     file_exists = os.path.isfile(LOG_FILE)
 
     with open(LOG_FILE, mode="a", newline="") as file:
@@ -260,6 +303,69 @@ def check_atr_trailing_stop(symbol, atr_multiplier):
     return False
 
 
+def check_dynamic_midpoint_stop(symbol):
+    """Raise a persisted midpoint stop and exit on an hourly close below it."""
+    if has_open_order(symbol):
+        print(f"Sell order already pending for {symbol}")
+        return True
+
+    try:
+        position = trading_client.get_open_position(symbol)
+        entry_price = float(position.avg_entry_price)
+        qty = float(position.qty)
+        data = fetch_price_history(symbol, period="1mo", interval="1h")
+        if data.empty:
+            print(f"Close unavailable for {symbol}. Skipping midpoint stop.")
+            return False
+        if len(data) < 2:
+            return False
+        # During market hours Yahoo's last hourly row can still be forming.
+        # Evaluate exits only from the preceding, completed bar.
+        completed_bar = data.iloc[-2]
+        current_close = float(completed_bar["Close"])
+        close_timestamp = str(data.index[-2])
+        current_price = float(position.current_price)
+
+        state = position_state.setdefault(
+            symbol,
+            {
+                "entry_price": entry_price,
+                "previous_high": entry_price,
+                "highest_price_since_entry": entry_price,
+                "current_midpoint_stop": entry_price,
+                "last_evaluated_close": close_timestamp,
+            },
+        )
+        # Alpaca remains authoritative for the average fill price.
+        update_midpoint_state(state, entry_price, current_price)
+        save_position_state()
+
+        print(f"{symbol} entry: {entry_price}")
+        print(f"{symbol} highest price: {state['highest_price_since_entry']}")
+        print(f"{symbol} midpoint stop: {state['current_midpoint_stop']}")
+
+        previous_close_timestamp = state.get("last_evaluated_close")
+        is_new_close = previous_close_timestamp is not None and previous_close_timestamp != close_timestamp
+        state["last_evaluated_close"] = close_timestamp
+        save_position_state()
+
+        if is_new_close and current_close < state["current_midpoint_stop"]:
+            pnl = (current_close - entry_price) * qty
+            log_trade(
+                symbol, "sell", qty, current_close, "dynamic_midpoint_stop",
+                entry_price, current_close, pnl,
+            )
+            place_trade(symbol, "sell", qty=qty, reason="dynamic_midpoint_stop")
+            mark_recently_sold(symbol)
+            position_state.pop(symbol, None)
+            save_position_state()
+            return True
+    except Exception as e:
+        raise_if_alpaca_unauthorized(e, f"check dynamic midpoint stop for {symbol}")
+        return False
+    return False
+
+
 def check_trailing_stop(symbol, trailing_percent):
     print("Fixed percent trailing stops are deprecated; using ATR trailing stop.")
     return check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
@@ -357,6 +463,13 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
                 position = trading_client.get_open_position(symbol)
                 entry_price = float(position.avg_entry_price)
                 qty = float(position.qty)
+                position_state[symbol] = {
+                    "entry_price": entry_price,
+                    "previous_high": entry_price,
+                    "highest_price_since_entry": entry_price,
+                    "current_midpoint_stop": entry_price,
+                }
+                save_position_state()
             except:
                 entry_price = None
                 qty = None

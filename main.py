@@ -4,6 +4,7 @@ from trader import (
     print_position,
     check_stop_loss,
     check_atr_trailing_stop,
+    check_dynamic_midpoint_stop,
     get_open_positions_count,
     get_total_market_value,
     already_holding,
@@ -37,6 +38,7 @@ from config import (
     MAX_NEW_BUYS_PER_CYCLE,
     BLOCKED_SYMBOLS,
     ENABLE_ATR_TRAILING_STOP,
+    ENABLE_DYNAMIC_MIDPOINT_STOP,
     ENABLE_ATR_TREND_FILTER,
     ENABLE_FIXED_STOP_LOSS,
     ENABLE_MACD_FILTER,
@@ -47,6 +49,7 @@ from config import (
     ENABLE_RELATIVE_STRENGTH_FILTER,
     ENABLE_TOP_CANDIDATE_SELECTION,
     ENABLE_VOLUME_FILTER,
+    ENABLE_BULLISH_CANDLE_CONFIRMATION,
 )
 
 import time
@@ -67,6 +70,7 @@ def run_bot():
         atr_trend_quality=ENABLE_ATR_TREND_FILTER,
         min_score=ENABLE_MIN_SCORE_FILTER and MIN_CANDIDATE_SCORE is not None,
         top_candidates=ENABLE_TOP_CANDIDATE_SELECTION,
+        bullish_candle=ENABLE_BULLISH_CANDLE_CONFIRMATION,
     )
 
     while True:
@@ -82,6 +86,8 @@ def run_bot():
                     check_stop_loss(symbol, STOP_LOSS_PERCENT)
                 if ENABLE_ATR_TRAILING_STOP:
                     check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
+                if ENABLE_DYNAMIC_MIDPOINT_STOP:
+                    check_dynamic_midpoint_stop(symbol)
 
                 if already_holding(symbol):
                     print_position(symbol)

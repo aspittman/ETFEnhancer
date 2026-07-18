@@ -10,6 +10,7 @@ from config import (
     BLOCKED_SYMBOLS,
     DOLLARS_PER_TRADE,
     ENABLE_ATR_TRAILING_STOP,
+    ENABLE_DYNAMIC_MIDPOINT_STOP,
     ENABLE_ATR_TREND_FILTER,
     ENABLE_FIXED_STOP_LOSS,
     ENABLE_MACD_FILTER,
@@ -20,6 +21,7 @@ from config import (
     ENABLE_RELATIVE_STRENGTH_FILTER,
     ENABLE_TOP_CANDIDATE_SELECTION,
     ENABLE_VOLUME_FILTER,
+    ENABLE_BULLISH_CANDLE_CONFIRMATION,
     MACD_FAST,
     MACD_SIGNAL,
     MACD_SLOW,
@@ -64,7 +66,9 @@ class BacktestConfig:
     enable_min_score_filter: bool = ENABLE_MIN_SCORE_FILTER
     enable_top_candidate_selection: bool = ENABLE_TOP_CANDIDATE_SELECTION
     enable_atr_trailing_stop: bool = ENABLE_ATR_TRAILING_STOP
+    enable_dynamic_midpoint_stop: bool = ENABLE_DYNAMIC_MIDPOINT_STOP
     enable_fixed_stop_loss: bool = ENABLE_FIXED_STOP_LOSS
+    enable_bullish_candle_confirmation: bool = ENABLE_BULLISH_CANDLE_CONFIRMATION
 
     def switches(self):
         return StrategySwitches(
@@ -78,6 +82,7 @@ class BacktestConfig:
             min_score=self.enable_min_score_filter
             and self.min_candidate_score is not None,
             top_candidates=self.enable_top_candidate_selection,
+            bullish_candle=self.enable_bullish_candle_confirmation,
         )
 
 
@@ -197,6 +202,8 @@ def _simulate_backtest(frames, benchmark, config):
                 "entry_price": price,
                 "qty": qty,
                 "highest_price": price,
+                "previous_high": price,
+                "current_midpoint_stop": price,
                 "entry_score": candidate["score"],
             }
             buys += 1
@@ -233,7 +240,15 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
             continue
 
         position = positions[symbol]
-        position["highest_price"] = max(position["highest_price"], float(row["High"]))
+        observed_high = float(row["High"])
+        if observed_high > position["highest_price"]:
+            old_high = position["highest_price"]
+            position["previous_high"] = old_high
+            position["highest_price"] = observed_high
+            position["current_midpoint_stop"] = max(
+                position["current_midpoint_stop"],
+                (old_high + observed_high) / 2,
+            )
 
         stop_price = position["entry_price"] * (1 - config.stop_loss_percent)
         atr = row.get("atr")
@@ -242,6 +257,7 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
             trail_price = position["highest_price"] - (float(atr) * config.atr_multiplier)
 
         low = float(row["Low"])
+        close = float(row["Close"])
         if config.enable_fixed_stop_loss and low <= stop_price:
             _close_position(
                 symbol,
@@ -250,6 +266,15 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
                 timestamp,
                 stop_price,
                 "stop_loss",
+            )
+        elif config.enable_dynamic_midpoint_stop and close < position["current_midpoint_stop"]:
+            _close_position(
+                symbol,
+                positions,
+                closed_trades,
+                timestamp,
+                close,
+                "dynamic_midpoint_stop",
             )
         elif trail_price is not None and low <= trail_price:
             _close_position(
@@ -344,6 +369,7 @@ def measure_filter_impact(symbols=None, config=None, blocked_symbols=None):
         ("min_score", "enable_min_score_filter"),
         ("top_candidate_selection", "enable_top_candidate_selection"),
         ("atr_trailing_stop", "enable_atr_trailing_stop"),
+        ("dynamic_midpoint_stop", "enable_dynamic_midpoint_stop"),
         ("fixed_stop_loss", "enable_fixed_stop_loss"),
     ]
     for name, field in toggles:
@@ -439,6 +465,32 @@ def _run_and_print_report(label, symbols, config, filter_impact=False):
     print_summary(result["summary"])
 
 
+def compare_exit_strategies(label, symbols, config):
+    print(f"\n===== {label.upper()} EXIT COMPARISON =====")
+    blocked = set(BLOCKED_SYMBOLS)
+    prepared = _prepare_frames(symbols, config, blocked)
+    for name, midpoint_enabled, atr_enabled in (
+        ("dynamic_midpoint", True, False),
+        ("atr_trailing", False, True),
+    ):
+        variant = BacktestConfig(
+            **{
+                **config.__dict__,
+                "enable_dynamic_midpoint_stop": midpoint_enabled,
+                "enable_atr_trailing_stop": atr_enabled,
+            }
+        )
+        print(f"\n--- {name} ---")
+        print_summary(
+            run_backtest(
+                symbols=symbols,
+                config=variant,
+                blocked_symbols=blocked,
+                prepared=prepared,
+            )["summary"]
+        )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run an offline strategy backtest.")
     parser.add_argument("--symbols", help="Comma-separated symbols. Defaults to universe.py.")
@@ -456,6 +508,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-buys-per-bar", type=int, default=MAX_BUYS_PER_CYCLE)
     parser.add_argument("--min-score", type=float, default=MIN_CANDIDATE_SCORE)
     parser.add_argument("--filter-impact", action="store_true")
+    parser.add_argument("--compare-exits", action="store_true")
     parser.add_argument("--disable-market-regime", action="store_true")
     parser.add_argument("--disable-ma-alignment", action="store_true")
     parser.add_argument("--disable-macd", action="store_true")
@@ -465,6 +518,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable-min-score", action="store_true")
     parser.add_argument("--disable-top-selection", action="store_true")
     parser.add_argument("--disable-atr-trailing-stop", action="store_true")
+    parser.add_argument("--disable-midpoint-stop", action="store_true")
     parser.add_argument("--disable-fixed-stop-loss", action="store_true")
     args = parser.parse_args()
 
@@ -484,13 +538,17 @@ if __name__ == "__main__":
         enable_atr_trend_filter=not args.disable_atr_trend,
         enable_min_score_filter=not args.disable_min_score,
         enable_top_candidate_selection=not args.disable_top_selection,
-        enable_atr_trailing_stop=not args.disable_atr_trailing_stop,
+        enable_atr_trailing_stop=ENABLE_ATR_TRAILING_STOP and not args.disable_atr_trailing_stop,
+        enable_dynamic_midpoint_stop=ENABLE_DYNAMIC_MIDPOINT_STOP and not args.disable_midpoint_stop,
         enable_fixed_stop_loss=not args.disable_fixed_stop_loss,
     )
 
     if args.symbols:
         symbols = _parse_symbols(args.symbols)
-        _run_and_print_report("custom", symbols, config, args.filter_impact)
+        if args.compare_exits:
+            compare_exit_strategies("custom", symbols, config)
+        else:
+            _run_and_print_report("custom", symbols, config, args.filter_impact)
     elif args.universe == "all":
         for universe_name in ("etf", "stock", "combined"):
             _run_and_print_report(
@@ -500,9 +558,8 @@ if __name__ == "__main__":
                 args.filter_impact,
             )
     else:
-        _run_and_print_report(
-            args.universe,
-            _symbols_for_universe(args.universe),
-            config,
-            args.filter_impact,
-        )
+        symbols = _symbols_for_universe(args.universe)
+        if args.compare_exits:
+            compare_exit_strategies(args.universe, symbols, config)
+        else:
+            _run_and_print_report(args.universe, symbols, config, args.filter_impact)
