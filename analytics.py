@@ -1,6 +1,8 @@
 import csv
 from collections import defaultdict
 from datetime import datetime
+from collections import Counter
+from statistics import median
 
 import pandas as pd
 
@@ -28,6 +30,11 @@ def summarize_closed_trades(trades):
             "average_win": 0.0,
             "average_loss": 0.0,
             "average_holding_period_hours": 0.0,
+            "median_holding_period_hours": 0.0,
+            "total_return": 0.0,
+            "exits_by_reason": {},
+            "confirmed_pivots": 0,
+            "average_pivot_confirmation_weeks": 0.0,
             "profit_factor": 0.0,
             "max_drawdown": 0.0,
             "best_symbol": None,
@@ -72,7 +79,16 @@ def summarize_closed_trades(trades):
         "average_win": float(wins["pnl"].mean()) if not wins.empty else 0.0,
         "average_loss": float(losses["pnl"].mean()) if not losses.empty else 0.0,
         "average_holding_period_hours": sum(holding_hours) / len(holding_hours) if holding_hours else 0.0,
-        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else 0.0,
+        "median_holding_period_hours": median(holding_hours) if holding_hours else 0.0,
+        "total_return": 0.0,
+        "exits_by_reason": dict(Counter(str(trade.get("exit_reason", "unknown")) for trade in trades)),
+        "confirmed_pivots": 0,
+        "average_pivot_confirmation_weeks": 0.0,
+        "profit_factor": (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else (float("inf") if gross_profit > 0 else 0.0)
+        ),
         "max_drawdown": abs(float(drawdown.min())) if not drawdown.empty else 0.0,
         "best_symbol": ranked_symbols[0][0] if ranked_symbols else None,
         "worst_symbol": ranked_symbols[-1][0] if ranked_symbols else None,
@@ -148,13 +164,21 @@ def print_summary(summary):
     print(f"Win rate: {summary['win_rate']:.2%}")
     print(f"Expectancy: ${summary['expectancy']:.2f}")
     print(f"Total P/L: ${summary['total_pnl']:.2f}")
+    print(f"Total return: {summary.get('total_return', 0.0):.2%}")
     print(f"Average win: ${summary['average_win']:.2f}")
     print(f"Average loss: ${summary['average_loss']:.2f}")
     print(f"Average holding period: {summary['average_holding_period_hours']:.1f} hours")
+    print(f"Median holding period: {summary.get('median_holding_period_hours', 0.0):.1f} hours")
     print(f"Profit factor: {summary['profit_factor']:.2f}")
     print(f"Max drawdown: ${summary.get('max_drawdown', 0.0):.2f}")
     print(f"Best symbol: {summary['best_symbol']}")
     print(f"Worst symbol: {summary['worst_symbol']}")
+    print(f"Exits by reason: {summary.get('exits_by_reason', {})}")
+    print(f"Confirmed pivots: {summary.get('confirmed_pivots', 0)}")
+    print(
+        "Average pivot confirmation time: "
+        f"{summary.get('average_pivot_confirmation_weeks', 0.0):.1f} weeks"
+    )
     print("\nBy symbol:")
     for symbol, stats in sorted(
         summary["by_symbol"].items(),

@@ -4,13 +4,14 @@ from trader import (
     print_position,
     check_stop_loss,
     check_atr_trailing_stop,
-    check_dynamic_midpoint_stop,
+    check_structural_midpoint_stop,
     get_open_positions_count,
     get_total_market_value,
     already_holding,
     trading_client,
     validate_alpaca_credentials,
     AlpacaAuthError,
+    get_symbol_pivot_state,
 )
 
 from strategy import StrategySwitches, get_market_regime, scan_universe, wait_for_market_open
@@ -38,7 +39,7 @@ from config import (
     MAX_NEW_BUYS_PER_CYCLE,
     BLOCKED_SYMBOLS,
     ENABLE_ATR_TRAILING_STOP,
-    ENABLE_DYNAMIC_MIDPOINT_STOP,
+    ENABLE_STRUCTURAL_MIDPOINT_STOP,
     ENABLE_ATR_TREND_FILTER,
     ENABLE_FIXED_STOP_LOSS,
     ENABLE_MACD_FILTER,
@@ -86,8 +87,8 @@ def run_bot():
                     check_stop_loss(symbol, STOP_LOSS_PERCENT)
                 if ENABLE_ATR_TRAILING_STOP:
                     check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
-                if ENABLE_DYNAMIC_MIDPOINT_STOP:
-                    check_dynamic_midpoint_stop(symbol)
+                if ENABLE_STRUCTURAL_MIDPOINT_STOP:
+                    check_structural_midpoint_stop(symbol)
 
                 if already_holding(symbol):
                     print_position(symbol)
@@ -121,10 +122,26 @@ def run_bot():
             MACD_SIGNAL,
             ATR_WINDOW,
             MIN_CANDIDATE_SCORE,
-            MAX_CANDIDATES_PER_CYCLE,
+            None,
             BLOCKED_SYMBOLS,
             MARKET_REGIME_SYMBOL,
             switches,
+        )
+        anchored_candidates = []
+        for candidate in candidates:
+            pivots = get_symbol_pivot_state(candidate["symbol"])
+            anchor = pivots.get("confirmed_swing_low") if pivots else None
+            if anchor is None:
+                print(f"{candidate['symbol']} has no confirmed structural low. Skipping entry.")
+                continue
+            candidate["trade_anchor_low"] = float(anchor)
+            candidate["structural_low_distance"] = (
+                candidate["price"] - float(anchor)
+            ) / float(anchor)
+            anchored_candidates.append(candidate)
+        candidates = sorted(
+            anchored_candidates,
+            key=lambda item: (item["structural_low_distance"], -item["score"]),
         )
 
         print(f"Found {len(candidates)} candidates.")

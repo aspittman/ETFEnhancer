@@ -8,6 +8,7 @@ from analytics import load_live_trade_log, pair_live_trade_log, summarize_closed
 from backtest import BacktestConfig, _market_is_healthy
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
 from trader import update_midpoint_state
+from pivots import new_pivot_state, update_pivot_state, update_structural_stop
 
 
 class StrategyTests(unittest.TestCase):
@@ -200,6 +201,43 @@ class BacktestConfigTests(unittest.TestCase):
         update_midpoint_state(state, 76.0, 100.0)
         self.assertEqual(state["previous_high"], 82.0)
         self.assertEqual(state["current_midpoint_stop"], 91.0)
+
+
+class PivotTests(unittest.TestCase):
+    def test_pivots_require_opposite_reversal_without_lookahead(self):
+        state = new_pivot_state()
+        closes = [100.0, 94.0, 99.0, 101.0, 110.0]
+        dates = pd.date_range("2026-01-02", periods=len(closes), freq="W-FRI")
+        for date, close in zip(dates, closes):
+            event = update_pivot_state(state, close, date, 0.06, 16, 3)
+
+        self.assertIsNone(state["confirmed_swing_high"])
+        self.assertEqual(state["confirmed_swing_low"], 94.0)
+        self.assertFalse(event["new_pivot_confirmed"])
+
+        event = update_pivot_state(
+            state, 103.0, dates[-1] + pd.Timedelta(weeks=1), 0.06, 16, 3
+        )
+        self.assertTrue(event["new_pivot_confirmed"])
+        self.assertEqual(event["pivot_type"], "high")
+        self.assertEqual(state["confirmed_swing_high"], 110.0)
+
+    def test_structural_stop_uses_confirmed_pivots_and_never_decreases(self):
+        position = {
+            "active_structural_low": 76.0,
+            "current_structural_stop": None,
+        }
+        pivots = {"confirmed_swing_low": 76.0, "confirmed_swing_high": 90.0}
+        self.assertTrue(update_structural_stop(position, pivots))
+        self.assertEqual(position["current_structural_stop"], 83.0)
+
+        pivots = {"confirmed_swing_low": 80.0, "confirmed_swing_high": 90.0}
+        self.assertTrue(update_structural_stop(position, pivots))
+        self.assertEqual(position["current_structural_stop"], 85.0)
+
+        pivots = {"confirmed_swing_low": 79.0, "confirmed_swing_high": 88.0}
+        self.assertFalse(update_structural_stop(position, pivots))
+        self.assertEqual(position["current_structural_stop"], 85.0)
 
 
 if __name__ == "__main__":

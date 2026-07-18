@@ -14,21 +14,39 @@ from config import (
     MACD_SLOW,
     MACD_SIGNAL,
     ATR_TRAILING_MULTIPLIER,
+    PIVOT_LOOKBACK_WEEKS,
+    PIVOT_REVERSAL_PERCENT,
+    MIN_WEEKS_BETWEEN_PIVOTS,
+    REQUIRE_CLOSE_BELOW_STRUCTURAL_STOP,
+    STRUCTURAL_STOP_EXIT_TIMEFRAME,
+    USE_TENTATIVE_HIGH_FOR_STOP,
+    PIVOT_TIMEFRAME,
+    PIVOT_PRICE_SOURCE,
+)
+from pivots import (
+    build_pivot_history,
+    completed_weekly_closes,
+    new_pivot_state,
+    update_pivot_state,
+    update_structural_stop,
 )
 import csv
 import json
 import os
 import time
 from datetime import datetime
+import pandas as pd
 from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
 
 highest_price = {}
 recently_sold = {}
 position_state = {}
+pivot_state = {}
 
 COOLDOWN_SECONDS = 3600  # 1 hour
 LOG_FILE = "logs/trades.csv"
 POSITION_STATE_FILE = "logs/position_state.json"
+PIVOT_STATE_FILE = "logs/pivot_state.json"
 ALPACA_READ_RETRIES = 3
 ALPACA_RETRY_DELAY_SECONDS = 2
 
@@ -47,6 +65,16 @@ def load_position_state():
     return position_state
 
 
+def load_pivot_state():
+    global pivot_state
+    try:
+        with open(PIVOT_STATE_FILE) as file:
+            pivot_state = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pivot_state = {}
+    return pivot_state
+
+
 def save_position_state():
     os.makedirs(os.path.dirname(POSITION_STATE_FILE), exist_ok=True)
     temporary = POSITION_STATE_FILE + ".tmp"
@@ -55,7 +83,16 @@ def save_position_state():
     os.replace(temporary, POSITION_STATE_FILE)
 
 
+def save_pivot_state():
+    os.makedirs(os.path.dirname(PIVOT_STATE_FILE), exist_ok=True)
+    temporary = PIVOT_STATE_FILE + ".tmp"
+    with open(temporary, "w") as file:
+        json.dump(pivot_state, file, indent=2, sort_keys=True)
+    os.replace(temporary, PIVOT_STATE_FILE)
+
+
 load_position_state()
+load_pivot_state()
 
 
 def update_midpoint_state(state, entry_price, observed_price):
@@ -366,6 +403,134 @@ def check_dynamic_midpoint_stop(symbol):
     return False
 
 
+def get_symbol_pivot_state(symbol):
+    """Update a symbol from completed weekly closes and persist its ZigZag state."""
+    data = fetch_price_history(symbol, period="1y", interval="1d")
+    if data.empty:
+        return pivot_state.get(symbol)
+    clock = alpaca_read(trading_client.get_clock, "check weekly-bar completion")
+    cutoff = pd.Timestamp.now().normalize()
+    if clock.is_open:
+        cutoff -= pd.Timedelta(days=1)
+    weekly = completed_weekly_closes(
+        data, as_of=cutoff, timeframe=PIVOT_TIMEFRAME,
+        price_source=PIVOT_PRICE_SOURCE,
+    )
+    state = pivot_state.get(symbol)
+    signature = {
+        "reversal_percent": PIVOT_REVERSAL_PERCENT,
+        "lookback_weeks": PIVOT_LOOKBACK_WEEKS,
+        "minimum_weeks": MIN_WEEKS_BETWEEN_PIVOTS,
+        "timeframe": PIVOT_TIMEFRAME,
+        "price_source": PIVOT_PRICE_SOURCE,
+    }
+    if state is None or state.get("configuration") != signature:
+        state, _, _ = build_pivot_history(
+            weekly,
+            PIVOT_REVERSAL_PERCENT,
+            PIVOT_LOOKBACK_WEEKS,
+            MIN_WEEKS_BETWEEN_PIVOTS,
+        )
+        state["configuration"] = signature
+        pivot_state[symbol] = state
+    else:
+        last_week = state.get("last_processed_week")
+        for date, close in weekly.items():
+            if last_week is not None and date <= pd.Timestamp(last_week):
+                continue
+            event = update_pivot_state(
+                state,
+                close,
+                date,
+                PIVOT_REVERSAL_PERCENT,
+                PIVOT_LOOKBACK_WEEKS,
+                MIN_WEEKS_BETWEEN_PIVOTS,
+            )
+            if event.get("message"):
+                print(f"{symbol} {event['message']}")
+    save_pivot_state()
+    return state
+
+
+def check_structural_midpoint_stop(symbol):
+    if has_open_order(symbol):
+        print(f"Sell order already pending for {symbol}")
+        return True
+    try:
+        position = trading_client.get_open_position(symbol)
+        entry_price = float(position.avg_entry_price)
+        qty = float(position.qty)
+        pivots = get_symbol_pivot_state(symbol)
+        if not pivots:
+            return False
+        state = position_state.setdefault(
+            symbol,
+            {
+                "entry_price": entry_price,
+                "trade_anchor_low": pivots.get("confirmed_swing_low"),
+                "active_structural_low": pivots.get("confirmed_swing_low"),
+                "current_structural_stop": None,
+            },
+        )
+        if state.get("active_structural_low") is None:
+            state["trade_anchor_low"] = pivots.get("confirmed_swing_low")
+            state["active_structural_low"] = pivots.get("confirmed_swing_low")
+        old_stop = state.get("current_structural_stop")
+        raised = update_structural_stop(state, pivots, USE_TENTATIVE_HIGH_FOR_STOP)
+        pivots["current_structural_stop"] = state.get("current_structural_stop")
+        save_pivot_state()
+        if raised:
+            print(
+                f"{symbol} structural stop raised from "
+                f"{old_stop if old_stop is not None else 'unset'} to "
+                f"{state['current_structural_stop']:.2f}."
+            )
+        save_position_state()
+
+        print(
+            f"{symbol} pivot_direction={pivots.get('pivot_direction')} "
+            f"candidate_low={pivots.get('candidate_swing_low')} "
+            f"confirmed_low={pivots.get('confirmed_swing_low')} "
+            f"candidate_high={pivots.get('candidate_swing_high')} "
+            f"confirmed_high={pivots.get('confirmed_swing_high')} "
+            f"weekly_close={pivots.get('current_weekly_close')} "
+            f"reversal={float(pivots.get('current_reversal_percent', 0)):.1%} "
+            f"active_low={state.get('active_structural_low')} "
+            f"structural_stop={state.get('current_structural_stop')}"
+        )
+        stop = state.get("current_structural_stop")
+        if stop is None:
+            return False
+        data = fetch_price_history(symbol, period="1mo", interval=STRUCTURAL_STOP_EXIT_TIMEFRAME)
+        if data.empty:
+            return False
+        clock = alpaca_read(trading_client.get_clock, "check exit-bar completion")
+        last_bar_date = pd.Timestamp(data.index[-1]).date()
+        today = pd.Timestamp.now().date()
+        row_index = -2 if clock.is_open and last_bar_date >= today and len(data) > 1 else -1
+        exit_price = float(data["Close"].iloc[row_index])
+        breached = exit_price < float(stop)
+        if not REQUIRE_CLOSE_BELOW_STRUCTURAL_STOP:
+            breached = float(position.current_price) < float(stop)
+            exit_price = float(position.current_price)
+        if breached:
+            pnl = (exit_price - entry_price) * qty
+            print(f"{symbol} exiting: completed close {exit_price:.2f} below structural stop {stop:.2f}.")
+            log_trade(
+                symbol, "sell", qty, exit_price, "structural_midpoint_stop",
+                entry_price, exit_price, pnl,
+            )
+            place_trade(symbol, "sell", qty=qty, reason="structural_midpoint_stop")
+            mark_recently_sold(symbol)
+            position_state.pop(symbol, None)
+            save_position_state()
+            return True
+    except Exception as e:
+        raise_if_alpaca_unauthorized(e, f"check structural midpoint stop for {symbol}")
+        print(f"Error checking structural midpoint stop for {symbol}: {e}")
+    return False
+
+
 def check_trailing_stop(symbol, trailing_percent):
     print("Fixed percent trailing stops are deprecated; using ATR trailing stop.")
     return check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
@@ -465,10 +630,15 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
                 qty = float(position.qty)
                 position_state[symbol] = {
                     "entry_price": entry_price,
-                    "previous_high": entry_price,
-                    "highest_price_since_entry": entry_price,
-                    "current_midpoint_stop": entry_price,
+                    "trade_anchor_low": None,
+                    "active_structural_low": None,
+                    "current_structural_stop": None,
                 }
+                pivots = get_symbol_pivot_state(symbol)
+                if pivots:
+                    anchor = pivots.get("confirmed_swing_low")
+                    position_state[symbol]["trade_anchor_low"] = anchor
+                    position_state[symbol]["active_structural_low"] = anchor
                 save_position_state()
             except:
                 entry_price = None

@@ -11,6 +11,7 @@ from config import (
     DOLLARS_PER_TRADE,
     ENABLE_ATR_TRAILING_STOP,
     ENABLE_DYNAMIC_MIDPOINT_STOP,
+    ENABLE_STRUCTURAL_MIDPOINT_STOP,
     ENABLE_ATR_TREND_FILTER,
     ENABLE_FIXED_STOP_LOSS,
     ENABLE_MACD_FILTER,
@@ -33,7 +34,15 @@ from config import (
     MA_SHORT,
     MIN_CANDIDATE_SCORE,
     STOP_LOSS_PERCENT,
+    PIVOT_LOOKBACK_WEEKS,
+    PIVOT_REVERSAL_PERCENT,
+    MIN_WEEKS_BETWEEN_PIVOTS,
+    USE_TENTATIVE_HIGH_FOR_STOP,
+    STRUCTURAL_STOP_EXIT_TIMEFRAME,
+    PIVOT_TIMEFRAME,
+    PIVOT_PRICE_SOURCE,
 )
+from pivots import completed_weekly_closes, new_pivot_state, update_pivot_state, update_structural_stop
 from strategy import (
     StrategySwitches,
     build_strategy_frame,
@@ -67,8 +76,16 @@ class BacktestConfig:
     enable_top_candidate_selection: bool = ENABLE_TOP_CANDIDATE_SELECTION
     enable_atr_trailing_stop: bool = ENABLE_ATR_TRAILING_STOP
     enable_dynamic_midpoint_stop: bool = ENABLE_DYNAMIC_MIDPOINT_STOP
+    enable_structural_midpoint_stop: bool = ENABLE_STRUCTURAL_MIDPOINT_STOP
     enable_fixed_stop_loss: bool = ENABLE_FIXED_STOP_LOSS
     enable_bullish_candle_confirmation: bool = ENABLE_BULLISH_CANDLE_CONFIRMATION
+    pivot_reversal_percent: float = PIVOT_REVERSAL_PERCENT
+    pivot_lookback_weeks: int = PIVOT_LOOKBACK_WEEKS
+    min_weeks_between_pivots: int = MIN_WEEKS_BETWEEN_PIVOTS
+    use_tentative_high_for_stop: bool = USE_TENTATIVE_HIGH_FOR_STOP
+    structural_stop_exit_timeframe: str = STRUCTURAL_STOP_EXIT_TIMEFRAME
+    pivot_timeframe: str = PIVOT_TIMEFRAME
+    pivot_price_source: str = PIVOT_PRICE_SOURCE
 
     def switches(self):
         return StrategySwitches(
@@ -92,9 +109,9 @@ def run_backtest(symbols=None, config=None, blocked_symbols=None, prepared=None)
     blocked = set(blocked_symbols if blocked_symbols is not None else BLOCKED_SYMBOLS)
 
     if prepared is None:
-        frames, benchmark = _prepare_frames(symbols, config, blocked)
+        frames, benchmark, pivot_daily = _prepare_frames(symbols, config, blocked)
     else:
-        frames, benchmark = prepared
+        frames, benchmark, pivot_daily = prepared
 
     frames = {
         symbol: score_strategy_frame(frame, config.switches())
@@ -103,11 +120,12 @@ def run_backtest(symbols=None, config=None, blocked_symbols=None, prepared=None)
     if benchmark is not None and not benchmark.empty:
         benchmark = score_strategy_frame(benchmark, config.switches())
 
-    return _simulate_backtest(frames, benchmark, config)
+    return _simulate_backtest(frames, benchmark, pivot_daily, config)
 
 
 def _prepare_frames(symbols, config, blocked):
     frames = {}
+    pivot_daily = {}
     for symbol in symbols:
         if symbol in blocked:
             continue
@@ -125,6 +143,9 @@ def _prepare_frames(symbols, config, blocked):
         )
         if not frame.empty:
             frames[symbol] = frame
+            daily = fetch_price_history(symbol, period=config.period, interval="1d")
+            if not daily.empty:
+                pivot_daily[symbol] = daily
 
     relative_strength_benchmark = frames.get(MARKET_REGIME_SYMBOL)
     if relative_strength_benchmark is None:
@@ -166,24 +187,41 @@ def _prepare_frames(symbols, config, blocked):
             benchmark_frame=relative_strength_benchmark,
         )
 
-    return frames, regime_benchmark
+    if MARKET_REGIME_SYMBOL in frames and MARKET_REGIME_SYMBOL not in pivot_daily:
+        pivot_daily[MARKET_REGIME_SYMBOL] = regime_data
+    return frames, regime_benchmark, pivot_daily
 
 
-def _simulate_backtest(frames, benchmark, config):
+def _simulate_backtest(frames, benchmark, pivot_daily, config):
     if not frames:
         return {"trades": [], "summary": summarize_closed_trades([])}
 
     calendar = sorted(set().union(*(frame.index for frame in frames.values())))
     positions = {}
     closed_trades = []
+    pivot_states = {symbol: new_pivot_state() for symbol in frames}
+    weekly_closes = {
+        symbol: completed_weekly_closes(
+            pivot_daily.get(symbol, frame),
+            timeframe=config.pivot_timeframe,
+            price_source=config.pivot_price_source,
+        )
+        for symbol, frame in frames.items()
+    }
+    pivot_cursors = {symbol: 0 for symbol in frames}
 
     for timestamp in calendar:
-        _manage_positions(timestamp, frames, positions, closed_trades, config)
+        _advance_backtest_pivots(
+            timestamp, weekly_closes, pivot_cursors, pivot_states, config
+        )
+        _manage_positions(
+            timestamp, frames, positions, closed_trades, config, pivot_states
+        )
 
         if config.enable_market_regime_filter and not _market_is_healthy(timestamp, benchmark):
             continue
 
-        candidates = _rank_candidates(timestamp, frames, positions, config)
+        candidates = _rank_candidates(timestamp, frames, positions, config, pivot_states)
         buys = 0
         for candidate in candidates:
             if len(positions) >= config.max_positions:
@@ -195,6 +233,9 @@ def _simulate_backtest(frames, benchmark, config):
 
             symbol = candidate["symbol"]
             price = candidate["price"]
+            anchor = pivot_states[symbol].get("confirmed_swing_low")
+            if anchor is None:
+                continue
             qty = config.dollars_per_trade / price
             positions[symbol] = {
                 "symbol": symbol,
@@ -204,6 +245,9 @@ def _simulate_backtest(frames, benchmark, config):
                 "highest_price": price,
                 "previous_high": price,
                 "current_midpoint_stop": price,
+                "trade_anchor_low": float(anchor),
+                "active_structural_low": float(anchor),
+                "current_structural_stop": None,
                 "entry_score": candidate["score"],
             }
             buys += 1
@@ -223,13 +267,37 @@ def _simulate_backtest(frames, benchmark, config):
             "end_of_backtest",
         )
 
+    summary = summarize_closed_trades(closed_trades)
+    summary["total_return"] = summary["total_pnl"] / config.max_total_capital if config.max_total_capital else 0.0
+    pivot_count = sum(int(state.get("confirmed_pivot_count", 0)) for state in pivot_states.values())
+    confirmation_weeks = sum(float(state.get("total_confirmation_weeks", 0)) for state in pivot_states.values())
+    summary["confirmed_pivots"] = pivot_count
+    summary["average_pivot_confirmation_weeks"] = confirmation_weeks / pivot_count if pivot_count else 0.0
     return {
         "trades": closed_trades,
-        "summary": summarize_closed_trades(closed_trades),
+        "summary": summary,
     }
 
 
-def _manage_positions(timestamp, frames, positions, closed_trades, config):
+def _advance_backtest_pivots(timestamp, weekly_closes, cursors, states, config):
+    now = pd.Timestamp(timestamp)
+    if now.tzinfo is not None:
+        now = now.tz_localize(None)
+    for symbol, weekly in weekly_closes.items():
+        items = list(weekly.items())
+        cursor = cursors[symbol]
+        # A Friday-labelled close is available after Friday has completed.
+        while cursor < len(items) and pd.Timestamp(items[cursor][0]) + pd.Timedelta(days=1) <= now:
+            date, close = items[cursor]
+            update_pivot_state(
+                states[symbol], close, date, config.pivot_reversal_percent,
+                config.pivot_lookback_weeks, config.min_weeks_between_pivots,
+            )
+            cursor += 1
+        cursors[symbol] = cursor
+
+
+def _manage_positions(timestamp, frames, positions, closed_trades, config, pivot_states):
     for symbol in list(positions):
         frame = frames.get(symbol)
         if frame is None or timestamp not in frame.index:
@@ -240,6 +308,12 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
             continue
 
         position = positions[symbol]
+        update_structural_stop(
+            position, pivot_states[symbol], config.use_tentative_high_for_stop
+        )
+        pivot_states[symbol]["current_structural_stop"] = position.get(
+            "current_structural_stop"
+        )
         observed_high = float(row["High"])
         if observed_high > position["highest_price"]:
             old_high = position["highest_price"]
@@ -258,6 +332,7 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
 
         low = float(row["Low"])
         close = float(row["Close"])
+        structural_close = _is_exit_close(timestamp, frame, config.structural_stop_exit_timeframe)
         if config.enable_fixed_stop_loss and low <= stop_price:
             _close_position(
                 symbol,
@@ -266,6 +341,20 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
                 timestamp,
                 stop_price,
                 "stop_loss",
+            )
+        elif (
+            config.enable_structural_midpoint_stop
+            and structural_close
+            and position.get("current_structural_stop") is not None
+            and close < position["current_structural_stop"]
+        ):
+            _close_position(
+                symbol,
+                positions,
+                closed_trades,
+                timestamp,
+                close,
+                "structural_midpoint_stop",
             )
         elif config.enable_dynamic_midpoint_stop and close < position["current_midpoint_stop"]:
             _close_position(
@@ -287,10 +376,13 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config):
             )
 
 
-def _rank_candidates(timestamp, frames, positions, config):
+def _rank_candidates(timestamp, frames, positions, config, pivot_states):
     candidates = []
     for symbol, frame in frames.items():
         if symbol in positions or timestamp not in frame.index:
+            continue
+        anchor = pivot_states[symbol].get("confirmed_swing_low")
+        if anchor is None:
             continue
 
         signal = signal_from_row(symbol, frame.loc[timestamp], config.switches())
@@ -303,11 +395,29 @@ def _rank_candidates(timestamp, frames, positions, config):
             or signal["score"] >= config.min_candidate_score
         )
         if passes_score:
+            signal["structural_low_distance"] = (signal["price"] - float(anchor)) / float(anchor)
             candidates.append(signal)
 
     if config.enable_top_candidate_selection:
-        candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+        candidates.sort(
+            key=lambda candidate: (
+                candidate["structural_low_distance"],
+                -candidate["score"],
+            )
+        )
     return candidates
+
+
+def _is_exit_close(timestamp, frame, timeframe):
+    timestamp = pd.Timestamp(timestamp)
+    same_day = frame.index[pd.DatetimeIndex(frame.index).date == timestamp.date()]
+    if len(same_day) == 0 or timestamp != same_day[-1]:
+        return False
+    if timeframe == "1d":
+        return True
+    if timeframe == "1wk":
+        return timestamp.weekday() == 4
+    return True
 
 
 def _capital_in_use(positions):
@@ -370,6 +480,7 @@ def measure_filter_impact(symbols=None, config=None, blocked_symbols=None):
         ("top_candidate_selection", "enable_top_candidate_selection"),
         ("atr_trailing_stop", "enable_atr_trailing_stop"),
         ("dynamic_midpoint_stop", "enable_dynamic_midpoint_stop"),
+        ("structural_midpoint_stop", "enable_structural_midpoint_stop"),
         ("fixed_stop_loss", "enable_fixed_stop_loss"),
     ]
     for name, field in toggles:
@@ -469,14 +580,16 @@ def compare_exit_strategies(label, symbols, config):
     print(f"\n===== {label.upper()} EXIT COMPARISON =====")
     blocked = set(BLOCKED_SYMBOLS)
     prepared = _prepare_frames(symbols, config, blocked)
-    for name, midpoint_enabled, atr_enabled in (
-        ("dynamic_midpoint", True, False),
-        ("atr_trailing", False, True),
+    for name, dynamic_enabled, structural_enabled, atr_enabled in (
+        ("per_price_midpoint", True, False, False),
+        ("weekly_structural_midpoint", False, True, False),
+        ("atr_trailing", False, False, True),
     ):
         variant = BacktestConfig(
             **{
                 **config.__dict__,
-                "enable_dynamic_midpoint_stop": midpoint_enabled,
+                "enable_dynamic_midpoint_stop": dynamic_enabled,
+                "enable_structural_midpoint_stop": structural_enabled,
                 "enable_atr_trailing_stop": atr_enabled,
             }
         )
@@ -489,6 +602,31 @@ def compare_exit_strategies(label, symbols, config):
                 prepared=prepared,
             )["summary"]
         )
+
+
+def run_pivot_grid(label, symbols, config):
+    print(f"\n===== {label.upper()} STRUCTURAL PIVOT GRID =====")
+    blocked = set(BLOCKED_SYMBOLS)
+    prepared = _prepare_frames(symbols, config, blocked)
+    for reversal in (0.04, 0.06, 0.08, 0.10):
+        for lookback in (12, 16, 26):
+            variant = BacktestConfig(
+                **{
+                    **config.__dict__,
+                    "pivot_reversal_percent": reversal,
+                    "pivot_lookback_weeks": lookback,
+                    "enable_dynamic_midpoint_stop": False,
+                    "enable_structural_midpoint_stop": True,
+                    "enable_atr_trailing_stop": False,
+                }
+            )
+            print(f"\n--- reversal={reversal:.0%} lookback={lookback}w ---")
+            print_summary(
+                run_backtest(
+                    symbols=symbols, config=variant, blocked_symbols=blocked,
+                    prepared=prepared,
+                )["summary"]
+            )
 
 
 if __name__ == "__main__":
@@ -509,6 +647,9 @@ if __name__ == "__main__":
     parser.add_argument("--min-score", type=float, default=MIN_CANDIDATE_SCORE)
     parser.add_argument("--filter-impact", action="store_true")
     parser.add_argument("--compare-exits", action="store_true")
+    parser.add_argument("--pivot-grid", action="store_true")
+    parser.add_argument("--pivot-reversal", type=float, default=PIVOT_REVERSAL_PERCENT)
+    parser.add_argument("--pivot-lookback", type=int, default=PIVOT_LOOKBACK_WEEKS)
     parser.add_argument("--disable-market-regime", action="store_true")
     parser.add_argument("--disable-ma-alignment", action="store_true")
     parser.add_argument("--disable-macd", action="store_true")
@@ -540,12 +681,17 @@ if __name__ == "__main__":
         enable_top_candidate_selection=not args.disable_top_selection,
         enable_atr_trailing_stop=ENABLE_ATR_TRAILING_STOP and not args.disable_atr_trailing_stop,
         enable_dynamic_midpoint_stop=ENABLE_DYNAMIC_MIDPOINT_STOP and not args.disable_midpoint_stop,
+        enable_structural_midpoint_stop=ENABLE_STRUCTURAL_MIDPOINT_STOP and not args.disable_midpoint_stop,
         enable_fixed_stop_loss=not args.disable_fixed_stop_loss,
+        pivot_reversal_percent=args.pivot_reversal,
+        pivot_lookback_weeks=args.pivot_lookback,
     )
 
     if args.symbols:
         symbols = _parse_symbols(args.symbols)
-        if args.compare_exits:
+        if args.pivot_grid:
+            run_pivot_grid("custom", symbols, config)
+        elif args.compare_exits:
             compare_exit_strategies("custom", symbols, config)
         else:
             _run_and_print_report("custom", symbols, config, args.filter_impact)
@@ -559,7 +705,9 @@ if __name__ == "__main__":
             )
     else:
         symbols = _symbols_for_universe(args.universe)
-        if args.compare_exits:
+        if args.pivot_grid:
+            run_pivot_grid(args.universe, symbols, config)
+        elif args.compare_exits:
             compare_exit_strategies(args.universe, symbols, config)
         else:
             _run_and_print_report(args.universe, symbols, config, args.filter_impact)
