@@ -5,6 +5,7 @@ from trader import (
     check_stop_loss,
     check_atr_trailing_stop,
     check_structural_midpoint_stop,
+    get_open_position_symbols,
     get_open_positions_count,
     get_total_market_value,
     already_holding,
@@ -59,7 +60,6 @@ import traceback
 
 def run_bot():
     validate_alpaca_credentials()
-    wait_for_market_open(trading_client)
     print("Starting trend scanner bot...")
     switches = StrategySwitches(
         market_regime=ENABLE_MARKET_REGIME_FILTER,
@@ -75,13 +75,20 @@ def run_bot():
     )
 
     while True:
+        # Recheck every cycle so a bot started during the session pauses after
+        # the closing bell instead of scanning and printing stale prices.
+        wait_for_market_open(trading_client)
+
         print("\n==============================")
         print("NEW BOT CYCLE STARTING")
         print("==============================")
 
         # Manage exits first
         print("\n=== MANAGING OPEN POSITIONS ===")
-        for symbol in UNIVERSE:
+        open_position_symbols = get_open_position_symbols()
+        if not open_position_symbols:
+            print("No open positions.")
+        for symbol in open_position_symbols:
             try:
                 if ENABLE_FIXED_STOP_LOSS:
                     check_stop_loss(symbol, STOP_LOSS_PERCENT)

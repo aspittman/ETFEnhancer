@@ -227,6 +227,13 @@ def get_total_market_value():
     )
     return sum(float(p.market_value) for p in positions)
 
+
+def get_open_position_symbols():
+    positions = alpaca_read(
+        trading_client.get_all_positions, "list open positions"
+    )
+    return [position.symbol for position in positions]
+
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
 
@@ -666,6 +673,8 @@ def print_account_info():
 
     print("\n===== ACCOUNT INFO =====")
     print(f"Equity: ${account.equity}")
+    print(f"Cash: ${account.cash}")
+    print(f"Position Value: ${account.long_market_value}")
     print(f"Buying Power: ${account.buying_power}")
     print("========================\n")
     

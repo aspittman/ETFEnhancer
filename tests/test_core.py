@@ -1,13 +1,14 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
 from analytics import load_live_trade_log, pair_live_trade_log, summarize_closed_trades
 from backtest import BacktestConfig, _market_is_healthy
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
-from trader import update_midpoint_state
+from trader import get_open_position_symbols, update_midpoint_state
 from pivots import new_pivot_state, update_pivot_state, update_structural_stop
 
 
@@ -201,6 +202,17 @@ class BacktestConfigTests(unittest.TestCase):
         update_midpoint_state(state, 76.0, 100.0)
         self.assertEqual(state["previous_high"], 82.0)
         self.assertEqual(state["current_midpoint_stop"], 91.0)
+
+
+class TradingAccountTests(unittest.TestCase):
+    @patch("trader.trading_client.get_all_positions")
+    def test_open_position_symbols_come_from_actual_positions(self, get_positions):
+        get_positions.return_value = [
+            type("Position", (), {"symbol": "XLE"})(),
+            type("Position", (), {"symbol": "XLRE"})(),
+        ]
+
+        self.assertEqual(get_open_position_symbols(), ["XLE", "XLRE"])
 
 
 class PivotTests(unittest.TestCase):
