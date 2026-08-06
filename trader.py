@@ -44,11 +44,14 @@ position_state = {}
 pivot_state = {}
 
 COOLDOWN_SECONDS = 3600  # 1 hour
-LOG_FILE = "logs/trades.csv"
-POSITION_STATE_FILE = "logs/position_state.json"
-PIVOT_STATE_FILE = "logs/pivot_state.json"
+TRADING_ENVIRONMENT = "paper" if ALPACA_PAPER else "live"
+LOG_FILE = f"logs/trades_{TRADING_ENVIRONMENT}.csv"
+POSITION_STATE_FILE = f"logs/position_state_{TRADING_ENVIRONMENT}.json"
+PIVOT_STATE_FILE = f"logs/pivot_state_{TRADING_ENVIRONMENT}.json"
 ALPACA_READ_RETRIES = 3
 ALPACA_RETRY_DELAY_SECONDS = 2
+ORDER_FILL_ATTEMPTS = 30
+ORDER_FILL_DELAY_SECONDS = 1
 
 
 class AlpacaAuthError(RuntimeError):
@@ -187,7 +190,10 @@ def is_in_cooldown(symbol):
     recently_sold.pop(symbol, None)
     return False
 
-def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=None, pnl=None):
+def log_trade(
+    symbol, side, qty, price, reason, entry_price=None, exit_price=None,
+    pnl=None, order_id=None, timestamp=None,
+):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     file_exists = os.path.isfile(LOG_FILE)
 
@@ -197,6 +203,8 @@ def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=Non
         if not file_exists:
             writer.writerow([
                 "timestamp",
+                "environment",
+                "order_id",
                 "symbol",
                 "side",
                 "qty",
@@ -208,7 +216,9 @@ def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=Non
             ])
 
         writer.writerow([
-            datetime.now(),
+            timestamp or datetime.now(),
+            TRADING_ENVIRONMENT,
+            order_id,
             symbol,
             side,
             qty,
@@ -218,6 +228,23 @@ def log_trade(symbol, side, qty, price, reason, entry_price=None, exit_price=Non
             exit_price,
             pnl
         ])
+
+
+def wait_for_order_fill(order_id):
+    """Return Alpaca's final filled order, or None after a bounded wait."""
+    for attempt in range(ORDER_FILL_ATTEMPTS):
+        order = alpaca_read(
+            lambda: trading_client.get_order_by_id(order_id),
+            f"check order {order_id} fill status",
+        )
+        status = str(getattr(order, "status", "")).lower()
+        if status.endswith("filled"):
+            return order
+        if any(status.endswith(value) for value in ("canceled", "expired", "rejected")):
+            return None
+        if attempt + 1 < ORDER_FILL_ATTEMPTS:
+            time.sleep(ORDER_FILL_DELAY_SECONDS)
+    return None
         
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 
@@ -321,24 +348,10 @@ def check_atr_trailing_stop(symbol, atr_multiplier):
             print("ATR TRAILING STOP TRIGGERED!")
 
             qty = float(position.qty)
-            pnl = (current_price - entry_price) * qty
-
-            log_trade(
-                symbol=symbol,
-                side="sell",
-                qty=qty,
-                price=current_price,
-                reason="atr_trailing_stop",
-                entry_price=entry_price,
-                exit_price=current_price,
-                pnl=pnl
-            )
-
-            place_trade(symbol, "sell", qty=qty, reason="atr_trailing_stop")
-            mark_recently_sold(symbol)
-            highest_price.pop(symbol, None)
-
-            return True
+            if place_trade(symbol, "sell", qty=qty, reason="atr_trailing_stop"):
+                mark_recently_sold(symbol)
+                highest_price.pop(symbol, None)
+                return True
 
     except Exception as e:
         raise_if_alpaca_unauthorized(e, f"check ATR trailing stop for {symbol}")
@@ -394,16 +407,11 @@ def check_dynamic_midpoint_stop(symbol):
         save_position_state()
 
         if is_new_close and current_close < state["current_midpoint_stop"]:
-            pnl = (current_close - entry_price) * qty
-            log_trade(
-                symbol, "sell", qty, current_close, "dynamic_midpoint_stop",
-                entry_price, current_close, pnl,
-            )
-            place_trade(symbol, "sell", qty=qty, reason="dynamic_midpoint_stop")
-            mark_recently_sold(symbol)
-            position_state.pop(symbol, None)
-            save_position_state()
-            return True
+            if place_trade(symbol, "sell", qty=qty, reason="dynamic_midpoint_stop"):
+                mark_recently_sold(symbol)
+                position_state.pop(symbol, None)
+                save_position_state()
+                return True
     except Exception as e:
         raise_if_alpaca_unauthorized(e, f"check dynamic midpoint stop for {symbol}")
         return False
@@ -521,17 +529,12 @@ def check_structural_midpoint_stop(symbol):
             breached = float(position.current_price) < float(stop)
             exit_price = float(position.current_price)
         if breached:
-            pnl = (exit_price - entry_price) * qty
             print(f"{symbol} exiting: completed close {exit_price:.2f} below structural stop {stop:.2f}.")
-            log_trade(
-                symbol, "sell", qty, exit_price, "structural_midpoint_stop",
-                entry_price, exit_price, pnl,
-            )
-            place_trade(symbol, "sell", qty=qty, reason="structural_midpoint_stop")
-            mark_recently_sold(symbol)
-            position_state.pop(symbol, None)
-            save_position_state()
-            return True
+            if place_trade(symbol, "sell", qty=qty, reason="structural_midpoint_stop"):
+                mark_recently_sold(symbol)
+                position_state.pop(symbol, None)
+                save_position_state()
+                return True
     except Exception as e:
         raise_if_alpaca_unauthorized(e, f"check structural midpoint stop for {symbol}")
         print(f"Error checking structural midpoint stop for {symbol}: {e}")
@@ -571,22 +574,9 @@ def check_stop_loss(symbol, stop_loss_percent):
             print("STOP LOSS TRIGGERED!")
 
             qty = float(position.qty)
-            pnl = (current_price - entry_price) * qty
-
-            log_trade(
-                symbol=symbol,
-                side="sell",
-                qty=qty,
-                price=current_price,
-                reason="stop_loss",
-                entry_price=entry_price,
-                exit_price=current_price,
-                pnl=pnl
-            )
-
-            place_trade(symbol, "sell", qty=qty, reason="stop_loss")
-            mark_recently_sold(symbol)
-            return True
+            if place_trade(symbol, "sell", qty=qty, reason="stop_loss"):
+                mark_recently_sold(symbol)
+                return True
 
     except Exception as e:
         raise_if_alpaca_unauthorized(e, f"check stop loss for {symbol}")
@@ -596,18 +586,25 @@ def check_stop_loss(symbol, stop_loss_percent):
 
 def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
     current_position = get_position(symbol)
+    entry_price = None
+    if side == "sell" and current_position > 0:
+        existing_position = alpaca_read(
+            lambda: trading_client.get_open_position(symbol),
+            f"get the {symbol} entry price before selling",
+        )
+        entry_price = float(existing_position.avg_entry_price)
 
     if has_open_order(symbol):
         print(f"Open order exists for {symbol}. Skipping...")
-        return
+        return False
 
     if side == "buy" and current_position > 0:
         print("Already holding position. Skipping buy.")
-        return
+        return False
 
     if side == "sell" and current_position == 0:
         print("No shares to sell. Skipping sell.")
-        return
+        return False
 
     if side == "buy":
         order = MarketOrderRequest(
@@ -626,47 +623,68 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
         )
 
     try:
-        trading_client.submit_order(order)
+        submitted_order = trading_client.submit_order(order)
+        filled_order = wait_for_order_fill(submitted_order.id)
+        if filled_order is None:
+            print(
+                f"Order {submitted_order.id} for {symbol} was not confirmed filled; "
+                "it was not added to the execution log."
+            )
+            return False
+
+        filled_price = float(filled_order.filled_avg_price)
+        filled_qty = float(filled_order.filled_qty)
+        filled_at = getattr(filled_order, "filled_at", None)
+        order_id = str(filled_order.id)
 
         if side == "buy":
-            print(f"Placed BUY order for ${notional} of {symbol}")
-
-            try:
-                position = trading_client.get_open_position(symbol)
-                entry_price = float(position.avg_entry_price)
-                qty = float(position.qty)
-                position_state[symbol] = {
-                    "entry_price": entry_price,
-                    "trade_anchor_low": None,
-                    "active_structural_low": None,
-                    "current_structural_stop": None,
-                }
-                pivots = get_symbol_pivot_state(symbol)
-                if pivots:
-                    anchor = pivots.get("confirmed_swing_low")
-                    position_state[symbol]["trade_anchor_low"] = anchor
-                    position_state[symbol]["active_structural_low"] = anchor
-                save_position_state()
-            except:
-                entry_price = None
-                qty = None
-
+            print(f"Filled BUY order for {filled_qty} shares of {symbol} at ${filled_price}")
+            entry_price = filled_price
             log_trade(
                 symbol=symbol,
                 side="buy",
-                qty=qty,
-                price=entry_price,
+                qty=filled_qty,
+                price=filled_price,
                 reason=reason,
                 entry_price=entry_price,
                 exit_price=None,
-                pnl=None
+                pnl=None,
+                order_id=order_id,
+                timestamp=filled_at,
             )
+            position_state[symbol] = {
+                "entry_price": entry_price,
+                "trade_anchor_low": None,
+                "active_structural_low": None,
+                "current_structural_stop": None,
+            }
+            pivots = get_symbol_pivot_state(symbol)
+            if pivots:
+                anchor = pivots.get("confirmed_swing_low")
+                position_state[symbol]["trade_anchor_low"] = anchor
+                position_state[symbol]["active_structural_low"] = anchor
+            save_position_state()
 
         else:
-            print(f"Placed SELL order for {qty} shares of {symbol}")
+            pnl = (filled_price - entry_price) * filled_qty
+            print(f"Filled SELL order for {filled_qty} shares of {symbol} at ${filled_price}")
+            log_trade(
+                symbol=symbol,
+                side="sell",
+                qty=filled_qty,
+                price=filled_price,
+                reason=reason,
+                entry_price=entry_price,
+                exit_price=filled_price,
+                pnl=pnl,
+                order_id=order_id,
+                timestamp=filled_at,
+            )
+        return True
 
     except Exception as e:
         print(f"Order failed: {e}")
+        return False
 
 def print_account_info():
     account = alpaca_read(trading_client.get_account, "get account information")

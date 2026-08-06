@@ -103,10 +103,27 @@ for each filter by toggling one switch at a time.
 
 ## Trade Analytics
 
-Analyze paired live trades from `logs/trades.csv`:
+Analyze confirmed paper fills:
 
 ```bash
-python analytics.py logs/trades.csv
+python analytics.py logs/trades_paper.csv
+```
+
+By default the report downloads hourly SPY prices and compares every completed
+trade with SPY over the same entry-to-exit window. It also reports SPY's
+buy-and-hold return from the first entry through the final exit. Use
+`--benchmark QQQ` to select another benchmark or `--no-benchmark` for an
+offline report.
+
+Live and paper executions are deliberately kept separate in
+`logs/trades_live.csv` and `logs/trades_paper.csv`. Each row also includes the
+environment and Alpaca order ID. The older `logs/trades.csv` file is preserved
+as a legacy record and is not appended to by new bot runs.
+
+To analyze confirmed live fills instead:
+
+```bash
+python analytics.py logs/trades_live.csv
 ```
 
 The report includes win rate, expectancy, total P/L, profit factor, best/worst

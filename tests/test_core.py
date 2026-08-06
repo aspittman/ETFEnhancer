@@ -5,7 +5,14 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from analytics import load_live_trade_log, pair_live_trade_log, summarize_closed_trades
+from analytics import (
+    add_benchmark_comparison,
+    load_live_trade_log,
+    pair_live_trade_log,
+    summarize_closed_trades,
+)
+from config import ALPACA_PAPER
+from trader import LOG_FILE, TRADING_ENVIRONMENT, wait_for_order_fill
 from backtest import BacktestConfig, _market_is_healthy
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
 from trader import get_open_position_symbols, update_midpoint_state
@@ -158,6 +165,63 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(summary["best_symbol"], "AAA")
         self.assertEqual(summary["worst_symbol"], "BBB")
 
+    def test_load_labeled_execution_log_preserves_environment_and_order_id(self):
+        contents = (
+            "timestamp,environment,order_id,symbol,side,qty,price,reason,entry_price,exit_price,pnl\n"
+            "2026-01-01,paper,order-1,AAA,buy,2,10,signal,10,,\n"
+            "2026-01-02,paper,order-2,AAA,sell,2,12,stop_loss,10,12,4\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trades_paper.csv"
+            path.write_text(contents)
+            rows = load_live_trade_log(path)
+            trades = pair_live_trade_log(rows)
+
+        self.assertEqual(rows[0]["environment"], "paper")
+        self.assertEqual(rows[0]["order_id"], "order-1")
+        self.assertEqual(trades[0]["environment"], "paper")
+
+    def test_execution_log_matches_configured_environment(self):
+        expected = "paper" if ALPACA_PAPER else "live"
+        self.assertEqual(TRADING_ENVIRONMENT, expected)
+        self.assertEqual(LOG_FILE, f"logs/trades_{expected}.csv")
+
+    def test_benchmark_compares_matching_trade_windows(self):
+        trades = [
+            {
+                "symbol": "AAA",
+                "entry_time": "2026-01-02 15:00:00",
+                "exit_time": "2026-01-05 15:00:00",
+                "entry_price": 100.0,
+                "exit_price": 110.0,
+                "qty": 1.0,
+                "pnl": 10.0,
+            },
+            {
+                "symbol": "BBB",
+                "entry_time": "2026-01-05 15:00:00",
+                "exit_time": "2026-01-06 15:00:00",
+                "entry_price": 50.0,
+                "exit_price": 50.0,
+                "qty": 2.0,
+                "pnl": 0.0,
+            },
+        ]
+        spy = pd.Series(
+            [100.0, 105.0, 110.0],
+            index=pd.to_datetime(
+                ["2026-01-02 15:00:00", "2026-01-05 15:00:00", "2026-01-06 15:00:00"]
+            ),
+        )
+
+        summary = add_benchmark_comparison(summarize_closed_trades(trades), trades, spy)
+
+        self.assertEqual(summary["benchmark_trade_count"], 2)
+        self.assertAlmostEqual(summary["matched_strategy_return"], 0.05)
+        self.assertAlmostEqual(summary["matched_benchmark_return"], (0.05 + (110 / 105 - 1)) / 2)
+        self.assertAlmostEqual(summary["benchmark_buy_hold_return"], 0.10)
+        self.assertEqual(summary["benchmark_outperformance_rate"], 0.5)
+
     def test_pair_live_trade_log_closes_buy_sell_pairs(self):
         trades = pair_live_trade_log(
             [
@@ -213,6 +277,22 @@ class TradingAccountTests(unittest.TestCase):
         ]
 
         self.assertEqual(get_open_position_symbols(), ["XLE", "XLRE"])
+
+    @patch("trader.time.sleep")
+    @patch("trader.alpaca_read")
+    def test_wait_for_order_fill_returns_confirmed_fill(self, alpaca_read, sleep):
+        accepted = type("Order", (), {"status": "accepted"})()
+        filled = type(
+            "Order",
+            (),
+            {"status": "filled", "filled_avg_price": "101.25", "filled_qty": "0.5"},
+        )()
+        alpaca_read.side_effect = [accepted, filled]
+
+        result = wait_for_order_fill("order-1")
+
+        self.assertIs(result, filled)
+        sleep.assert_called_once()
 
 
 class PivotTests(unittest.TestCase):
