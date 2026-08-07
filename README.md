@@ -87,6 +87,7 @@ python backtest.py --min-score 3 --max-buys-per-bar 1
 python backtest.py --filter-impact --universe etf --period 2y
 python backtest.py --compare-exits --universe etf --period 2y
 python backtest.py --pivot-grid --universe etf --period 2y
+python backtest.py --walk-forward --window-months 6 --warmup-months 6 --cost-bps 5 --universe etf --period 2y
 ```
 
 The backtester uses the same pullback entry, relative-strength scoring versus SPY,
@@ -100,6 +101,11 @@ lookbacks. Pivot confirmation is advanced sequentially after completed weekly
 bars, without using a future reversal before it occurs.
 `--filter-impact` prints total P/L, expectancy, win rate, profit factor, and deltas
 for each filter by toggling one switch at a time.
+`--walk-forward` runs independent sequential windows and reports strategy versus
+SPY return, excess return, capital exposure, genuine strategy exits, forced
+window-end exits, and estimated transaction costs. `--cost-bps 5` applies five
+basis points on both entry and exit. The initial `--warmup-months 6` is used to
+seed indicators and pivots and is excluded from scored windows.
 
 ## Trade Analytics
 

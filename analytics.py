@@ -297,6 +297,10 @@ def print_summary(summary):
     print(f"Median holding period: {summary.get('median_holding_period_hours', 0.0):.1f} hours")
     print(f"Profit factor: {summary['profit_factor']:.2f}")
     print(f"Max drawdown: ${summary.get('max_drawdown', 0.0):.2f}")
+    if "average_capital_exposure" in summary:
+        print(f"Average capital exposure: {summary['average_capital_exposure']:.2%}")
+        print(f"Genuine strategy exits: {summary.get('strategy_exit_count', 0)}")
+        print(f"Forced end-of-test exits: {summary.get('forced_exit_count', 0)}")
     if summary.get("benchmark_trade_count"):
         benchmark = summary["benchmark_symbol"]
         print(f"\n===== {benchmark} BENCHMARK =====")

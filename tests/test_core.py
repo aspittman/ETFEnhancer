@@ -13,7 +13,7 @@ from analytics import (
 )
 from config import ALPACA_PAPER
 from trader import LOG_FILE, TRADING_ENVIRONMENT, wait_for_order_fill
-from backtest import BacktestConfig, _market_is_healthy
+from backtest import BacktestConfig, _benchmark_window_return, _close_position, _market_is_healthy
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
 from trader import get_open_position_symbols, update_midpoint_state
 from pivots import new_pivot_state, update_pivot_state, update_structural_stop
@@ -266,6 +266,36 @@ class BacktestConfigTests(unittest.TestCase):
         update_midpoint_state(state, 76.0, 100.0)
         self.assertEqual(state["previous_high"], 82.0)
         self.assertEqual(state["current_midpoint_stop"], 91.0)
+
+    def test_transaction_cost_is_deducted_from_backtest_trade(self):
+        positions = {
+            "AAA": {
+                "entry_time": pd.Timestamp("2026-01-01"),
+                "entry_price": 100.0,
+                "qty": 1.0,
+                "entry_score": 1.0,
+                "transaction_cost_bps": 5.0,
+            }
+        }
+        trades = []
+
+        _close_position("AAA", positions, trades, pd.Timestamp("2026-01-02"), 110.0, "test")
+
+        self.assertAlmostEqual(trades[0]["gross_pnl"], 10.0)
+        self.assertAlmostEqual(trades[0]["estimated_cost"], 0.105)
+        self.assertAlmostEqual(trades[0]["pnl"], 9.895)
+
+    def test_benchmark_window_return_uses_matching_dates(self):
+        benchmark = pd.DataFrame(
+            {"Close": [100.0, 105.0, 110.0]},
+            index=pd.to_datetime(["2026-01-01", "2026-02-01", "2026-03-01"]),
+        )
+
+        result = _benchmark_window_return(
+            benchmark, pd.Timestamp("2026-01-15"), pd.Timestamp("2026-03-02")
+        )
+
+        self.assertAlmostEqual(result, 110 / 105 - 1)
 
 
 class TradingAccountTests(unittest.TestCase):

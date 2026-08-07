@@ -86,6 +86,7 @@ class BacktestConfig:
     structural_stop_exit_timeframe: str = STRUCTURAL_STOP_EXIT_TIMEFRAME
     pivot_timeframe: str = PIVOT_TIMEFRAME
     pivot_price_source: str = PIVOT_PRICE_SOURCE
+    transaction_cost_bps: float = 0.0
 
     def switches(self):
         return StrategySwitches(
@@ -103,7 +104,10 @@ class BacktestConfig:
         )
 
 
-def run_backtest(symbols=None, config=None, blocked_symbols=None, prepared=None):
+def run_backtest(
+    symbols=None, config=None, blocked_symbols=None, prepared=None,
+    start=None, end=None,
+):
     config = config or BacktestConfig()
     symbols = list(symbols or UNIVERSE)
     blocked = set(blocked_symbols if blocked_symbols is not None else BLOCKED_SYMBOLS)
@@ -120,7 +124,7 @@ def run_backtest(symbols=None, config=None, blocked_symbols=None, prepared=None)
     if benchmark is not None and not benchmark.empty:
         benchmark = score_strategy_frame(benchmark, config.switches())
 
-    return _simulate_backtest(frames, benchmark, pivot_daily, config)
+    return _simulate_backtest(frames, benchmark, pivot_daily, config, start, end)
 
 
 def _prepare_frames(symbols, config, blocked):
@@ -192,13 +196,20 @@ def _prepare_frames(symbols, config, blocked):
     return frames, regime_benchmark, pivot_daily
 
 
-def _simulate_backtest(frames, benchmark, pivot_daily, config):
+def _simulate_backtest(frames, benchmark, pivot_daily, config, start=None, end=None):
     if not frames:
         return {"trades": [], "summary": summarize_closed_trades([])}
 
     calendar = sorted(set().union(*(frame.index for frame in frames.values())))
+    if start is not None:
+        calendar = [timestamp for timestamp in calendar if timestamp >= pd.Timestamp(start)]
+    if end is not None:
+        calendar = [timestamp for timestamp in calendar if timestamp < pd.Timestamp(end)]
+    if not calendar:
+        return {"trades": [], "summary": summarize_closed_trades([])}
     positions = {}
     closed_trades = []
+    allocation_samples = []
     pivot_states = {symbol: new_pivot_state() for symbol in frames}
     weekly_closes = {
         symbol: completed_weekly_closes(
@@ -211,6 +222,10 @@ def _simulate_backtest(frames, benchmark, pivot_daily, config):
     pivot_cursors = {symbol: 0 for symbol in frames}
 
     for timestamp in calendar:
+        allocation_samples.append(
+            _capital_in_use(positions) / config.max_total_capital
+            if config.max_total_capital else 0.0
+        )
         _advance_backtest_pivots(
             timestamp, weekly_closes, pivot_cursors, pivot_states, config
         )
@@ -249,6 +264,7 @@ def _simulate_backtest(frames, benchmark, pivot_daily, config):
                 "active_structural_low": float(anchor),
                 "current_structural_stop": None,
                 "entry_score": candidate["score"],
+                "transaction_cost_bps": config.transaction_cost_bps,
             }
             buys += 1
 
@@ -273,6 +289,15 @@ def _simulate_backtest(frames, benchmark, pivot_daily, config):
     confirmation_weeks = sum(float(state.get("total_confirmation_weeks", 0)) for state in pivot_states.values())
     summary["confirmed_pivots"] = pivot_count
     summary["average_pivot_confirmation_weeks"] = confirmation_weeks / pivot_count if pivot_count else 0.0
+    summary["average_capital_exposure"] = (
+        sum(allocation_samples) / len(allocation_samples) if allocation_samples else 0.0
+    )
+    summary["strategy_exit_count"] = sum(
+        trade["exit_reason"] != "end_of_backtest" for trade in closed_trades
+    )
+    summary["forced_exit_count"] = sum(
+        trade["exit_reason"] == "end_of_backtest" for trade in closed_trades
+    )
     return {
         "trades": closed_trades,
         "summary": summary,
@@ -534,7 +559,12 @@ def print_filter_impact(rows):
 
 def _close_position(symbol, positions, closed_trades, timestamp, exit_price, reason):
     position = positions.pop(symbol)
-    pnl = (exit_price - position["entry_price"]) * position["qty"]
+    gross_pnl = (exit_price - position["entry_price"]) * position["qty"]
+    cost_rate = float(position.get("transaction_cost_bps", 0.0)) / 10000
+    estimated_cost = (
+        position["entry_price"] * position["qty"] + exit_price * position["qty"]
+    ) * cost_rate
+    pnl = gross_pnl - estimated_cost
     closed_trades.append(
         {
             "symbol": symbol,
@@ -544,6 +574,8 @@ def _close_position(symbol, positions, closed_trades, timestamp, exit_price, rea
             "exit_price": exit_price,
             "qty": position["qty"],
             "pnl": pnl,
+            "gross_pnl": gross_pnl,
+            "estimated_cost": estimated_cost,
             "return_pct": (exit_price - position["entry_price"]) / position["entry_price"],
             "entry_score": position["entry_score"],
             "exit_reason": reason,
@@ -564,6 +596,127 @@ def _symbols_for_universe(name):
         "combined": COMBINED_UNIVERSE,
     }
     return list(universes[name])
+
+
+def run_walk_forward(
+    symbols=None, config=None, window_months=6, warmup_months=6,
+    blocked_symbols=None,
+):
+    """Run sequential, independent windows over one shared historical dataset."""
+    if window_months <= 0:
+        raise ValueError("window_months must be positive")
+    if warmup_months < 0:
+        raise ValueError("warmup_months cannot be negative")
+    config = config or BacktestConfig()
+    symbols = list(symbols or UNIVERSE)
+    blocked = set(blocked_symbols if blocked_symbols is not None else BLOCKED_SYMBOLS)
+    prepared = _prepare_frames(symbols, config, blocked)
+    frames, benchmark, _ = prepared
+    if not frames:
+        return []
+
+    calendar = pd.DatetimeIndex(sorted(set().union(*(frame.index for frame in frames.values()))))
+    start = calendar.min() + pd.DateOffset(months=warmup_months)
+    final = calendar.max() + pd.Timedelta(microseconds=1)
+    rows = []
+    window_number = 1
+    while start < final:
+        end = min(start + pd.DateOffset(months=window_months), final)
+        result = run_backtest(
+            symbols=symbols,
+            config=config,
+            blocked_symbols=blocked,
+            prepared=prepared,
+            start=start,
+            end=end,
+        )
+        summary = result["summary"]
+        spy_return = _benchmark_window_return(benchmark, start, end)
+        rows.append(
+            {
+                "window": window_number,
+                "start": start,
+                "end": end,
+                "strategy_return": summary.get("total_return", 0.0),
+                "spy_return": spy_return,
+                "excess_return": (
+                    summary.get("total_return", 0.0) - spy_return
+                    if spy_return is not None else None
+                ),
+                "total_pnl": summary.get("total_pnl", 0.0),
+                "trades": summary.get("total_trades", 0),
+                "strategy_exits": summary.get("strategy_exit_count", 0),
+                "forced_exits": summary.get("forced_exit_count", 0),
+                "exposure": summary.get("average_capital_exposure", 0.0),
+                "max_drawdown": summary.get("max_drawdown", 0.0),
+            }
+        )
+        start = end
+        window_number += 1
+    return rows
+
+
+def _benchmark_window_return(benchmark, start, end):
+    if benchmark is None or benchmark.empty or "Close" not in benchmark:
+        return None
+    window = benchmark.loc[
+        (benchmark.index >= pd.Timestamp(start)) & (benchmark.index < pd.Timestamp(end)),
+        "Close",
+    ].dropna()
+    if len(window) < 2 or float(window.iloc[0]) <= 0:
+        return None
+    return float(window.iloc[-1] / window.iloc[0] - 1)
+
+
+def print_walk_forward(rows):
+    print("===== WALK-FORWARD REPORT =====")
+    print(
+        "window,start,end,strategy_return,spy_return,excess_return,pnl,trades,"
+        "strategy_exits,forced_exits,exposure,max_drawdown"
+    )
+    for row in rows:
+        spy = row["spy_return"]
+        excess = row["excess_return"]
+        spy_text = f"{spy:.2%}" if spy is not None else "n/a"
+        excess_text = f"{excess:.2%}" if excess is not None else "n/a"
+        print(
+            f"{row['window']},{pd.Timestamp(row['start']).date()},"
+            f"{pd.Timestamp(row['end']).date()},{row['strategy_return']:.2%},"
+            f"{spy_text},{excess_text},"
+            f"${row['total_pnl']:.2f},{row['trades']},{row['strategy_exits']},"
+            f"{row['forced_exits']},{row['exposure']:.2%},${row['max_drawdown']:.2f}"
+        )
+
+    comparable = [row for row in rows if row["spy_return"] is not None]
+    if not comparable:
+        return
+    strategy_compound = 1.0
+    spy_compound = 1.0
+    for row in comparable:
+        strategy_compound *= 1 + row["strategy_return"]
+        spy_compound *= 1 + row["spy_return"]
+    print("\n===== WALK-FORWARD SUMMARY =====")
+    print(f"Windows: {len(rows)}")
+    print(f"Strategy compounded return: {strategy_compound - 1:.2%}")
+    print(f"SPY compounded return: {spy_compound - 1:.2%}")
+    print(
+        "Windows beating SPY: "
+        f"{sum(row['strategy_return'] > row['spy_return'] for row in comparable)}/"
+        f"{len(comparable)}"
+    )
+    print(f"Total trades: {sum(row['trades'] for row in rows)}")
+    print(f"Genuine strategy exits: {sum(row['strategy_exits'] for row in rows)}")
+    print(f"Forced window-end exits: {sum(row['forced_exits'] for row in rows)}")
+    print(f"Average capital exposure: {sum(row['exposure'] for row in rows) / len(rows):.2%}")
+
+
+def _run_walk_forward_report(label, symbols, config, window_months, warmup_months):
+    print(f"\n===== {label.upper()} WALK-FORWARD BACKTEST =====")
+    print_walk_forward(
+        run_walk_forward(
+            symbols, config, window_months, warmup_months=warmup_months
+        )
+    )
 
 
 def _run_and_print_report(label, symbols, config, filter_impact=False):
@@ -648,6 +801,13 @@ if __name__ == "__main__":
     parser.add_argument("--filter-impact", action="store_true")
     parser.add_argument("--compare-exits", action="store_true")
     parser.add_argument("--pivot-grid", action="store_true")
+    parser.add_argument("--walk-forward", action="store_true")
+    parser.add_argument("--window-months", type=int, default=6)
+    parser.add_argument("--warmup-months", type=int, default=6)
+    parser.add_argument(
+        "--cost-bps", type=float, default=0.0,
+        help="Estimated cost in basis points on each entry and exit.",
+    )
     parser.add_argument("--pivot-reversal", type=float, default=PIVOT_REVERSAL_PERCENT)
     parser.add_argument("--pivot-lookback", type=int, default=PIVOT_LOOKBACK_WEEKS)
     parser.add_argument("--disable-market-regime", action="store_true")
@@ -685,11 +845,16 @@ if __name__ == "__main__":
         enable_fixed_stop_loss=not args.disable_fixed_stop_loss,
         pivot_reversal_percent=args.pivot_reversal,
         pivot_lookback_weeks=args.pivot_lookback,
+        transaction_cost_bps=args.cost_bps,
     )
 
     if args.symbols:
         symbols = _parse_symbols(args.symbols)
-        if args.pivot_grid:
+        if args.walk_forward:
+            _run_walk_forward_report(
+                "custom", symbols, config, args.window_months, args.warmup_months
+            )
+        elif args.pivot_grid:
             run_pivot_grid("custom", symbols, config)
         elif args.compare_exits:
             compare_exit_strategies("custom", symbols, config)
@@ -697,15 +862,24 @@ if __name__ == "__main__":
             _run_and_print_report("custom", symbols, config, args.filter_impact)
     elif args.universe == "all":
         for universe_name in ("etf", "stock", "combined"):
-            _run_and_print_report(
-                universe_name,
-                _symbols_for_universe(universe_name),
-                config,
-                args.filter_impact,
-            )
+            symbols = _symbols_for_universe(universe_name)
+            if args.walk_forward:
+                _run_walk_forward_report(
+                    universe_name, symbols, config, args.window_months,
+                    args.warmup_months,
+                )
+            else:
+                _run_and_print_report(
+                    universe_name, symbols, config, args.filter_impact,
+                )
     else:
         symbols = _symbols_for_universe(args.universe)
-        if args.pivot_grid:
+        if args.walk_forward:
+            _run_walk_forward_report(
+                args.universe, symbols, config, args.window_months,
+                args.warmup_months,
+            )
+        elif args.pivot_grid:
             run_pivot_grid(args.universe, symbols, config)
         elif args.compare_exits:
             compare_exit_strategies(args.universe, symbols, config)
