@@ -34,6 +34,7 @@ import csv
 import json
 import os
 import time
+import uuid
 from datetime import datetime
 import pandas as pd
 from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
@@ -52,6 +53,7 @@ ALPACA_READ_RETRIES = 3
 ALPACA_RETRY_DELAY_SECONDS = 2
 ORDER_FILL_ATTEMPTS = 30
 ORDER_FILL_DELAY_SECONDS = 1
+ORDER_CLIENT_ID_PREFIX = f"etfenhancer-{TRADING_ENVIRONMENT}"
 
 
 class AlpacaAuthError(RuntimeError):
@@ -248,18 +250,32 @@ def wait_for_order_fill(order_id):
         
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=ALPACA_PAPER)
 
-def get_total_market_value():
+def get_managed_positions():
+    """Return only account positions explicitly opened and owned by this bot."""
     positions = alpaca_read(
-        trading_client.get_all_positions, "calculate total market value"
+        trading_client.get_all_positions, "list ETFEnhancer-managed positions"
     )
-    return sum(float(p.market_value) for p in positions)
+    return [position for position in positions if position.symbol in position_state]
+
+
+def managed_entry_price(symbol, position):
+    return float(position_state.get(symbol, {}).get("entry_price", position.avg_entry_price))
+
+
+def managed_quantity(symbol, position):
+    return float(position_state.get(symbol, {}).get("qty", position.qty))
+
+
+def get_total_market_value():
+    total = 0.0
+    for position in get_managed_positions():
+        owned_qty = float(position_state[position.symbol].get("qty", position.qty))
+        total += abs(owned_qty) * float(position.current_price)
+    return total
 
 
 def get_open_position_symbols():
-    positions = alpaca_read(
-        trading_client.get_all_positions, "list open positions"
-    )
-    return [position.symbol for position in positions]
+    return [position.symbol for position in get_managed_positions()]
 
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import QueryOrderStatus
@@ -287,8 +303,7 @@ def already_holding(symbol):
     return get_position(symbol) > 0
 
 def get_open_positions_count():
-    positions = alpaca_read(trading_client.get_all_positions, "count open positions")
-    return len(positions)
+    return len(get_managed_positions())
 
 def get_latest_atr(symbol):
     data = fetch_price_history(symbol, period="1y", interval="1h")
@@ -322,7 +337,7 @@ def check_atr_trailing_stop(symbol, atr_multiplier):
     try:
         position = trading_client.get_open_position(symbol)
 
-        entry_price = float(position.avg_entry_price)
+        entry_price = managed_entry_price(symbol, position)
         current_price = float(position.current_price)
 
         # Initialize highest price
@@ -347,7 +362,7 @@ def check_atr_trailing_stop(symbol, atr_multiplier):
         if current_price <= trail_stop_price:
             print("ATR TRAILING STOP TRIGGERED!")
 
-            qty = float(position.qty)
+            qty = managed_quantity(symbol, position)
             if place_trade(symbol, "sell", qty=qty, reason="atr_trailing_stop"):
                 mark_recently_sold(symbol)
                 highest_price.pop(symbol, None)
@@ -368,8 +383,8 @@ def check_dynamic_midpoint_stop(symbol):
 
     try:
         position = trading_client.get_open_position(symbol)
-        entry_price = float(position.avg_entry_price)
-        qty = float(position.qty)
+        entry_price = managed_entry_price(symbol, position)
+        qty = managed_quantity(symbol, position)
         data = fetch_price_history(symbol, period="1mo", interval="1h")
         if data.empty:
             print(f"Close unavailable for {symbol}. Skipping midpoint stop.")
@@ -473,8 +488,8 @@ def check_structural_midpoint_stop(symbol):
         return True
     try:
         position = trading_client.get_open_position(symbol)
-        entry_price = float(position.avg_entry_price)
-        qty = float(position.qty)
+        entry_price = managed_entry_price(symbol, position)
+        qty = managed_quantity(symbol, position)
         pivots = get_symbol_pivot_state(symbol)
         if not pivots:
             return False
@@ -561,7 +576,7 @@ def check_stop_loss(symbol, stop_loss_percent):
     try:
         position = trading_client.get_open_position(symbol)
 
-        entry_price = float(position.avg_entry_price)
+        entry_price = managed_entry_price(symbol, position)
         current_price = float(position.current_price)
 
         loss_threshold = entry_price * (1 - stop_loss_percent)
@@ -573,7 +588,7 @@ def check_stop_loss(symbol, stop_loss_percent):
         if current_price <= loss_threshold:
             print("STOP LOSS TRIGGERED!")
 
-            qty = float(position.qty)
+            qty = managed_quantity(symbol, position)
             if place_trade(symbol, "sell", qty=qty, reason="stop_loss"):
                 mark_recently_sold(symbol)
                 return True
@@ -587,12 +602,14 @@ def check_stop_loss(symbol, stop_loss_percent):
 def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
     current_position = get_position(symbol)
     entry_price = None
-    if side == "sell" and current_position > 0:
-        existing_position = alpaca_read(
-            lambda: trading_client.get_open_position(symbol),
-            f"get the {symbol} entry price before selling",
-        )
-        entry_price = float(existing_position.avg_entry_price)
+    if side == "sell":
+        managed_state = position_state.get(symbol)
+        if managed_state is None:
+            print(f"{symbol} is not owned by ETFEnhancer. Skipping sell.")
+            return False
+        entry_price = float(managed_state["entry_price"])
+        owned_qty = float(managed_state.get("qty", qty or current_position))
+        qty = min(float(qty or owned_qty), owned_qty)
 
     if has_open_order(symbol):
         print(f"Open order exists for {symbol}. Skipping...")
@@ -611,7 +628,8 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
             symbol=symbol,
             notional=notional,
             side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY
+            time_in_force=TimeInForce.DAY,
+            client_order_id=f"{ORDER_CLIENT_ID_PREFIX}-{uuid.uuid4().hex[:20]}",
         )
 
     else:
@@ -619,7 +637,8 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
             symbol=symbol,
             qty=qty,
             side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY
+            time_in_force=TimeInForce.DAY,
+            client_order_id=f"{ORDER_CLIENT_ID_PREFIX}-{uuid.uuid4().hex[:20]}",
         )
 
     try:
@@ -654,6 +673,8 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
             )
             position_state[symbol] = {
                 "entry_price": entry_price,
+                "qty": filled_qty,
+                "entry_order_id": order_id,
                 "trade_anchor_low": None,
                 "active_structural_low": None,
                 "current_structural_stop": None,
@@ -680,6 +701,8 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
                 order_id=order_id,
                 timestamp=filled_at,
             )
+            position_state.pop(symbol, None)
+            save_position_state()
         return True
 
     except Exception as e:
@@ -688,12 +711,13 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
 
 def print_account_info():
     account = alpaca_read(trading_client.get_account, "get account information")
+    managed_value = get_total_market_value()
 
     print("\n===== ACCOUNT INFO =====")
-    print(f"Equity: ${account.equity}")
-    print(f"Cash: ${account.cash}")
-    print(f"Position Value: ${account.long_market_value}")
-    print(f"Buying Power: ${account.buying_power}")
+    print(f"Shared Account Equity: ${account.equity}")
+    print(f"Shared Account Cash: ${account.cash}")
+    print(f"ETFEnhancer Position Value: ${managed_value:.2f}")
+    print(f"Shared Account Buying Power: ${account.buying_power}")
     print("========================\n")
     
 def print_position(symbol):

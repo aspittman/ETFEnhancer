@@ -15,7 +15,13 @@ from config import ALPACA_PAPER
 from trader import LOG_FILE, TRADING_ENVIRONMENT, wait_for_order_fill
 from backtest import BacktestConfig, _benchmark_window_return, _close_position, _market_is_healthy
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
-from trader import get_open_position_symbols, update_midpoint_state
+from trader import (
+    get_open_position_symbols,
+    get_total_market_value,
+    place_trade,
+    position_state,
+    update_midpoint_state,
+)
 from pivots import new_pivot_state, update_pivot_state, update_structural_stop
 
 
@@ -306,7 +312,33 @@ class TradingAccountTests(unittest.TestCase):
             type("Position", (), {"symbol": "XLRE"})(),
         ]
 
-        self.assertEqual(get_open_position_symbols(), ["XLE", "XLRE"])
+        with patch.dict(position_state, {"XLE": {"entry_price": 50}}, clear=True):
+            self.assertEqual(get_open_position_symbols(), ["XLE"])
+
+    @patch("trader.trading_client.get_all_positions")
+    def test_shared_account_positions_do_not_consume_bot_capital(self, get_positions):
+        get_positions.return_value = [
+            type(
+                "Position", (),
+                {"symbol": "XLE", "qty": "2", "current_price": "55"},
+            )(),
+            type(
+                "Position", (),
+                {"symbol": "MSFT", "qty": "10", "current_price": "500"},
+            )(),
+        ]
+
+        with patch.dict(
+            position_state,
+            {"XLE": {"entry_price": 50, "qty": 0.5}},
+            clear=True,
+        ):
+            self.assertAlmostEqual(get_total_market_value(), 27.5)
+
+    @patch("trader.get_position", return_value=1)
+    def test_bot_refuses_to_sell_unowned_position(self, get_position):
+        with patch.dict(position_state, {}, clear=True):
+            self.assertFalse(place_trade("MSFT", "sell", qty=1, reason="test"))
 
     @patch("trader.time.sleep")
     @patch("trader.alpaca_read")
