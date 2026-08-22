@@ -13,13 +13,21 @@ from analytics import (
 )
 from config import ALPACA_PAPER
 from trader import LOG_FILE, TRADING_ENVIRONMENT, wait_for_order_fill
-from backtest import BacktestConfig, _benchmark_window_return, _close_position, _market_is_healthy
+from backtest import (
+    BacktestConfig,
+    _benchmark_window_return,
+    _close_position,
+    _manage_spy_core,
+    _market_is_healthy,
+    _rank_candidates,
+)
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
 from trader import (
     get_open_position_symbols,
     get_total_market_value,
     place_trade,
     position_state,
+    reconcile_position_state,
     update_midpoint_state,
 )
 from pivots import new_pivot_state, update_pivot_state, update_structural_stop
@@ -255,6 +263,54 @@ class AnalyticsTests(unittest.TestCase):
 
 
 class BacktestConfigTests(unittest.TestCase):
+    def test_spy_core_enters_at_target_and_exits_on_weak_regime(self):
+        timestamp = pd.Timestamp("2026-01-02")
+        frames = {
+            "SPY": pd.DataFrame(
+                {"Close": [100.0]}, index=pd.DatetimeIndex([timestamp])
+            )
+        }
+        positions = {}
+        trades = []
+        config = BacktestConfig(
+            max_total_capital=100.0,
+            spy_core_allocation_percent=0.6,
+            transaction_cost_bps=0.0,
+        )
+
+        _manage_spy_core(timestamp, frames, positions, trades, config, True)
+        self.assertEqual(positions["SPY"]["position_role"], "core")
+        self.assertAlmostEqual(positions["SPY"]["qty"], 0.6)
+
+        _manage_spy_core(timestamp, frames, positions, trades, config, False)
+        self.assertNotIn("SPY", positions)
+        self.assertEqual(trades[0]["exit_reason"], "market_regime_exit")
+
+    @patch("backtest.signal_from_row")
+    def test_tactical_candidates_must_outperform_spy(self, signal_from_row):
+        timestamp = pd.Timestamp("2026-01-02")
+        frames = {
+            symbol: pd.DataFrame({"Close": [100.0]}, index=[timestamp])
+            for symbol in ("SPY", "XLK", "XLP")
+        }
+        signals = {
+            "XLK": {"symbol": "XLK", "price": 100.0, "score": 2.0,
+                    "relative_strength": 0.04},
+            "XLP": {"symbol": "XLP", "price": 100.0, "score": 4.0,
+                    "relative_strength": -0.02},
+        }
+        signal_from_row.side_effect = lambda symbol, row, switches: signals[symbol]
+        pivots = {
+            symbol: {"confirmed_swing_low": 90.0}
+            for symbol in frames
+        }
+
+        candidates = _rank_candidates(
+            timestamp, frames, {}, BacktestConfig(), pivots
+        )
+
+        self.assertEqual([candidate["symbol"] for candidate in candidates], ["XLK"])
+
     def test_backtest_config_uses_atr_multiplier(self):
         config = BacktestConfig(atr_multiplier=2.5)
         self.assertEqual(config.atr_multiplier, 2.5)
@@ -305,6 +361,35 @@ class BacktestConfigTests(unittest.TestCase):
 
 
 class TradingAccountTests(unittest.TestCase):
+    @patch("trader.get_position", return_value=0)
+    def test_local_state_blocks_duplicate_buy_during_broker_lag(self, get_position):
+        with patch.dict(
+            position_state,
+            {"XLP": {"entry_price": 85.0, "qty": 0.25}},
+            clear=True,
+        ):
+            self.assertFalse(place_trade("XLP", "buy", notional=25))
+
+    @patch("trader.save_position_state")
+    @patch("trader.alpaca_read")
+    def test_reconcile_removes_only_stale_managed_state(self, alpaca_read, save_state):
+        alpaca_read.side_effect = [
+            [type("Position", (), {"symbol": "XLE"})()],
+            [type("Order", (), {"symbol": "XLP"})()],
+        ]
+        with patch.dict(
+            position_state,
+            {
+                "XLE": {"entry_price": 60.0},
+                "XLP": {"entry_price": 85.0},
+                "XLV": {"entry_price": 170.0},
+            },
+            clear=True,
+        ):
+            self.assertEqual(reconcile_position_state(), ["XLV"])
+            self.assertEqual(set(position_state), {"XLE", "XLP"})
+            save_state.assert_called_once()
+
     @patch("trader.trading_client.get_all_positions")
     def test_open_position_symbols_come_from_actual_positions(self, get_positions):
         get_positions.return_value = [

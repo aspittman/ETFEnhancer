@@ -27,6 +27,13 @@ live keys. Mixing paper/live keys and mode will make Alpaca return
 Key risk and selection settings live in `config.py`:
 
 - `ETF_ONLY_MODE`: defaults to `True`; the live universe is ETF-only by default.
+- `ENABLE_SPY_CORE` and `SPY_CORE_ALLOCATION_PERCENT`: keep 60% of the bot's
+  capital in SPY while the market regime is healthy. The core exits when the
+  regime turns weak and is not managed by tactical midpoint or ATR exits.
+- `REQUIRE_POSITIVE_RELATIVE_STRENGTH`: tactical ETFs must outperform SPY over
+  the strategy's relative-strength window before they can be purchased.
+- `RANK_TACTICAL_BY_RELATIVE_STRENGTH`: ranks qualifying tactical candidates by
+  excess return versus SPY before structural distance and blended score.
 - `BLOCKED_SYMBOLS`: symbols blocked from new entries. Empty by default.
 - `MARKET_REGIME_SYMBOL`: benchmark used to decide whether new buys are allowed.
   New long entries require SPY to be above its 200-day moving average and its

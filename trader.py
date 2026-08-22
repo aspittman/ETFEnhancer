@@ -61,12 +61,15 @@ class AlpacaAuthError(RuntimeError):
 
 
 def load_position_state():
-    global position_state
     try:
         with open(POSITION_STATE_FILE) as file:
-            position_state = json.load(file)
+            loaded_state = json.load(file)
     except (FileNotFoundError, json.JSONDecodeError):
-        position_state = {}
+        loaded_state = {}
+    # Keep the object identity stable so callers and tests holding a reference
+    # always see the freshly loaded state.
+    position_state.clear()
+    position_state.update(loaded_state)
     return position_state
 
 
@@ -300,7 +303,40 @@ def has_open_order(symbol):
     return False
 
 def already_holding(symbol):
-    return get_position(symbol) > 0
+    # Alpaca's position endpoint can briefly lag a confirmed fractional fill.
+    # The durable bot state is therefore also an entry guard.
+    return symbol in position_state or get_position(symbol) > 0
+
+
+def reconcile_position_state():
+    """Remove state for positions that were closed outside ETFEnhancer.
+
+    Unknown shared-account positions are deliberately not adopted. A pending
+    order protects state from being removed while Alpaca is settling a fill.
+    """
+    positions = alpaca_read(
+        trading_client.get_all_positions, "reconcile ETFEnhancer positions"
+    )
+    actual_symbols = {position.symbol for position in positions}
+    request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+    orders = alpaca_read(
+        lambda: trading_client.get_orders(filter=request),
+        "reconcile ETFEnhancer open orders",
+    )
+    pending_symbols = {order.symbol for order in orders}
+    stale_symbols = sorted(
+        symbol for symbol in position_state
+        if symbol not in actual_symbols and symbol not in pending_symbols
+    )
+    if stale_symbols:
+        for symbol in stale_symbols:
+            position_state.pop(symbol, None)
+        save_position_state()
+        print(
+            "Removed stale ETFEnhancer position state: "
+            + ", ".join(stale_symbols)
+        )
+    return stale_symbols
 
 def get_open_positions_count():
     return len(get_managed_positions())
@@ -599,7 +635,13 @@ def check_stop_loss(symbol, stop_loss_percent):
 
     return False
 
-def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
+def place_trade(
+    symbol, side, qty=None, notional=15, reason="signal", position_role="tactical"
+):
+    if side == "buy" and symbol in position_state:
+        print("Already holding position. Skipping buy.")
+        return False
+
     current_position = get_position(symbol)
     entry_price = None
     if side == "sell":
@@ -671,13 +713,21 @@ def place_trade(symbol, side, qty=None, notional=15, reason="signal"):
                 order_id=order_id,
                 timestamp=filled_at,
             )
+            previous = position_state.get(symbol, {})
+            previous_qty = float(previous.get("qty", 0.0))
+            combined_qty = previous_qty + filled_qty
+            combined_entry = (
+                float(previous.get("entry_price", entry_price)) * previous_qty
+                + entry_price * filled_qty
+            ) / combined_qty
             position_state[symbol] = {
-                "entry_price": entry_price,
-                "qty": filled_qty,
+                "entry_price": combined_entry,
+                "qty": combined_qty,
                 "entry_order_id": order_id,
-                "trade_anchor_low": None,
-                "active_structural_low": None,
-                "current_structural_stop": None,
+                "position_role": previous.get("position_role", position_role),
+                "trade_anchor_low": previous.get("trade_anchor_low"),
+                "active_structural_low": previous.get("active_structural_low"),
+                "current_structural_stop": previous.get("current_structural_stop"),
             }
             pivots = get_symbol_pivot_state(symbol)
             if pivots:

@@ -12,6 +12,14 @@ MAX_POSITIONS = 5
 MAX_TOTAL_CAPITAL = 130
 ETF_ONLY_MODE = True
 
+# Benchmark-aware portfolio construction. While the market regime is healthy,
+# keep this share of bot capital in SPY and use the remainder for tactical ETF
+# pullbacks that are outperforming SPY over the relative-strength window.
+ENABLE_SPY_CORE = True
+SPY_CORE_ALLOCATION_PERCENT = 0.60
+REQUIRE_POSITIVE_RELATIVE_STRENGTH = True
+RANK_TACTICAL_BY_RELATIVE_STRENGTH = True
+
 HARD_STOP_PERCENT = 0.08
 # Backward-compatible name used by older integrations.
 STOP_LOSS_PERCENT = HARD_STOP_PERCENT

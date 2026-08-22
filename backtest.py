@@ -41,6 +41,10 @@ from config import (
     STRUCTURAL_STOP_EXIT_TIMEFRAME,
     PIVOT_TIMEFRAME,
     PIVOT_PRICE_SOURCE,
+    ENABLE_SPY_CORE,
+    SPY_CORE_ALLOCATION_PERCENT,
+    REQUIRE_POSITIVE_RELATIVE_STRENGTH,
+    RANK_TACTICAL_BY_RELATIVE_STRENGTH,
 )
 from pivots import completed_weekly_closes, new_pivot_state, update_pivot_state, update_structural_stop
 from strategy import (
@@ -87,6 +91,10 @@ class BacktestConfig:
     pivot_timeframe: str = PIVOT_TIMEFRAME
     pivot_price_source: str = PIVOT_PRICE_SOURCE
     transaction_cost_bps: float = 0.0
+    enable_spy_core: bool = ENABLE_SPY_CORE
+    spy_core_allocation_percent: float = SPY_CORE_ALLOCATION_PERCENT
+    require_positive_relative_strength: bool = REQUIRE_POSITIVE_RELATIVE_STRENGTH
+    rank_tactical_by_relative_strength: bool = RANK_TACTICAL_BY_RELATIVE_STRENGTH
 
     def switches(self):
         return StrategySwitches(
@@ -233,7 +241,13 @@ def _simulate_backtest(frames, benchmark, pivot_daily, config, start=None, end=N
             timestamp, frames, positions, closed_trades, config, pivot_states
         )
 
-        if config.enable_market_regime_filter and not _market_is_healthy(timestamp, benchmark):
+        market_healthy = _market_is_healthy(timestamp, benchmark)
+        if config.enable_spy_core:
+            _manage_spy_core(
+                timestamp, frames, positions, closed_trades, config, market_healthy
+            )
+
+        if config.enable_market_regime_filter and not market_healthy:
             continue
 
         candidates = _rank_candidates(timestamp, frames, positions, config, pivot_states)
@@ -265,6 +279,7 @@ def _simulate_backtest(frames, benchmark, pivot_daily, config, start=None, end=N
                 "current_structural_stop": None,
                 "entry_score": candidate["score"],
                 "transaction_cost_bps": config.transaction_cost_bps,
+                "position_role": "tactical",
             }
             buys += 1
 
@@ -324,6 +339,8 @@ def _advance_backtest_pivots(timestamp, weekly_closes, cursors, states, config):
 
 def _manage_positions(timestamp, frames, positions, closed_trades, config, pivot_states):
     for symbol in list(positions):
+        if positions[symbol].get("position_role") == "core":
+            continue
         frame = frames.get(symbol)
         if frame is None or timestamp not in frame.index:
             continue
@@ -404,6 +421,8 @@ def _manage_positions(timestamp, frames, positions, closed_trades, config, pivot
 def _rank_candidates(timestamp, frames, positions, config, pivot_states):
     candidates = []
     for symbol, frame in frames.items():
+        if config.enable_spy_core and symbol == MARKET_REGIME_SYMBOL:
+            continue
         if symbol in positions or timestamp not in frame.index:
             continue
         anchor = pivot_states[symbol].get("confirmed_swing_low")
@@ -420,17 +439,66 @@ def _rank_candidates(timestamp, frames, positions, config, pivot_states):
             or signal["score"] >= config.min_candidate_score
         )
         if passes_score:
+            if (
+                config.require_positive_relative_strength
+                and signal["relative_strength"] <= 0
+            ):
+                continue
             signal["structural_low_distance"] = (signal["price"] - float(anchor)) / float(anchor)
             candidates.append(signal)
 
     if config.enable_top_candidate_selection:
-        candidates.sort(
-            key=lambda candidate: (
-                candidate["structural_low_distance"],
-                -candidate["score"],
+        if config.rank_tactical_by_relative_strength:
+            candidates.sort(
+                key=lambda candidate: (
+                    -candidate["relative_strength"],
+                    candidate["structural_low_distance"],
+                    -candidate["score"],
+                )
             )
-        )
+        else:
+            candidates.sort(
+                key=lambda candidate: (
+                    candidate["structural_low_distance"],
+                    -candidate["score"],
+                )
+            )
     return candidates
+
+
+def _manage_spy_core(
+    timestamp, frames, positions, closed_trades, config, market_healthy
+):
+    symbol = MARKET_REGIME_SYMBOL
+    frame = frames.get(symbol)
+    if frame is None or timestamp not in frame.index:
+        return
+    close = frame.loc[timestamp].get("Close")
+    if pd.isna(close):
+        return
+    close = float(close)
+    core = positions.get(symbol)
+    if not market_healthy:
+        if core and core.get("position_role") == "core":
+            _close_position(
+                symbol, positions, closed_trades, timestamp, close,
+                "market_regime_exit",
+            )
+        return
+    if core is not None:
+        return
+    notional = config.max_total_capital * config.spy_core_allocation_percent
+    if notional <= 0:
+        return
+    positions[symbol] = {
+        "symbol": symbol,
+        "entry_time": timestamp,
+        "entry_price": close,
+        "qty": notional / close,
+        "entry_score": 0.0,
+        "transaction_cost_bps": config.transaction_cost_bps,
+        "position_role": "core",
+    }
 
 
 def _is_exit_close(timestamp, frame, timeframe):

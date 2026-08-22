@@ -13,6 +13,7 @@ from trader import (
     validate_alpaca_credentials,
     AlpacaAuthError,
     get_symbol_pivot_state,
+    reconcile_position_state,
 )
 
 from strategy import StrategySwitches, get_market_regime, scan_universe, wait_for_market_open
@@ -52,7 +53,12 @@ from config import (
     ENABLE_TOP_CANDIDATE_SELECTION,
     ENABLE_VOLUME_FILTER,
     ENABLE_BULLISH_CANDLE_CONFIRMATION,
+    ENABLE_SPY_CORE,
+    SPY_CORE_ALLOCATION_PERCENT,
+    REQUIRE_POSITIVE_RELATIVE_STRENGTH,
+    RANK_TACTICAL_BY_RELATIVE_STRENGTH,
 )
+from trader import position_state
 
 import time
 import traceback
@@ -78,6 +84,7 @@ def run_bot():
         # Recheck every cycle so a bot started during the session pauses after
         # the closing bell instead of scanning and printing stale prices.
         wait_for_market_open(trading_client)
+        reconcile_position_state()
 
         print("\n==============================")
         print("NEW BOT CYCLE STARTING")
@@ -90,11 +97,12 @@ def run_bot():
             print("No open positions.")
         for symbol in open_position_symbols:
             try:
-                if ENABLE_FIXED_STOP_LOSS:
+                is_core = position_state.get(symbol, {}).get("position_role") == "core"
+                if ENABLE_FIXED_STOP_LOSS and not is_core:
                     check_stop_loss(symbol, STOP_LOSS_PERCENT)
-                if ENABLE_ATR_TRAILING_STOP:
+                if ENABLE_ATR_TRAILING_STOP and not is_core:
                     check_atr_trailing_stop(symbol, ATR_TRAILING_MULTIPLIER)
-                if ENABLE_STRUCTURAL_MIDPOINT_STOP:
+                if ENABLE_STRUCTURAL_MIDPOINT_STOP and not is_core:
                     check_structural_midpoint_stop(symbol)
 
                 if already_holding(symbol):
@@ -107,7 +115,8 @@ def run_bot():
 
         # Scan for new entries
         print("\n=== SCANNING FOR NEW ENTRIES ===")
-        if switches.market_regime:
+        regime = None
+        if switches.market_regime or ENABLE_SPY_CORE:
             regime = get_market_regime(
                 MARKET_REGIME_SYMBOL,
                 MARKET_REGIME_MA_SHORT,
@@ -115,10 +124,34 @@ def run_bot():
             )
             print(f"Market regime: {regime}")
             if not regime["is_healthy"]:
-                print("Market regime is weak. Skipping new buys this cycle.")
-                print_account_info()
-                time.sleep(SCAN_INTERVAL_SECONDS)
-                continue
+                core_state = position_state.get(MARKET_REGIME_SYMBOL, {})
+                if core_state.get("position_role") == "core":
+                    place_trade(
+                        MARKET_REGIME_SYMBOL,
+                        "sell",
+                        qty=core_state.get("qty"),
+                        reason="market_regime_exit",
+                    )
+                if switches.market_regime:
+                    print("Market regime is weak. Skipping new buys this cycle.")
+                    print_account_info()
+                    time.sleep(SCAN_INTERVAL_SECONDS)
+                    continue
+
+        if (
+            ENABLE_SPY_CORE
+            and regime is not None
+            and regime["is_healthy"]
+            and not already_holding(MARKET_REGIME_SYMBOL)
+        ):
+            core_notional = MAX_TOTAL_CAPITAL * SPY_CORE_ALLOCATION_PERCENT
+            place_trade(
+                MARKET_REGIME_SYMBOL,
+                "buy",
+                notional=core_notional,
+                reason="healthy_market_core",
+                position_role="core",
+            )
 
         candidates = scan_universe(
             UNIVERSE,
@@ -136,6 +169,13 @@ def run_bot():
         )
         anchored_candidates = []
         for candidate in candidates:
+            if ENABLE_SPY_CORE and candidate["symbol"] == MARKET_REGIME_SYMBOL:
+                continue
+            if (
+                REQUIRE_POSITIVE_RELATIVE_STRENGTH
+                and candidate["relative_strength"] <= 0
+            ):
+                continue
             pivots = get_symbol_pivot_state(candidate["symbol"])
             anchor = pivots.get("confirmed_swing_low") if pivots else None
             if anchor is None:
@@ -146,10 +186,20 @@ def run_bot():
                 candidate["price"] - float(anchor)
             ) / float(anchor)
             anchored_candidates.append(candidate)
-        candidates = sorted(
-            anchored_candidates,
-            key=lambda item: (item["structural_low_distance"], -item["score"]),
-        )
+        if RANK_TACTICAL_BY_RELATIVE_STRENGTH:
+            candidates = sorted(
+                anchored_candidates,
+                key=lambda item: (
+                    -item["relative_strength"],
+                    item["structural_low_distance"],
+                    -item["score"],
+                ),
+            )
+        else:
+            candidates = sorted(
+                anchored_candidates,
+                key=lambda item: (item["structural_low_distance"], -item["score"]),
+            )
 
         print(f"Found {len(candidates)} candidates.")
         for rank, candidate in enumerate(candidates[:MAX_CANDIDATES_PER_CYCLE], start=1):
@@ -187,8 +237,8 @@ def run_bot():
             if is_in_cooldown(symbol):
                 continue
             
-            place_trade(symbol, "buy", notional=DOLLARS_PER_TRADE)
-            buys_this_cycle += 1
+            if place_trade(symbol, "buy", notional=DOLLARS_PER_TRADE):
+                buys_this_cycle += 1
             time.sleep(3)
 
             open_positions = get_open_positions_count()
