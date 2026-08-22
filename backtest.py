@@ -54,7 +54,7 @@ from strategy import (
     score_strategy_frame,
     signal_from_row,
 )
-from universe import COMBINED_UNIVERSE, ETF_UNIVERSE, STOCK_UNIVERSE, UNIVERSE
+from universe import ETF_UNIVERSE, UNIVERSE
 
 
 @dataclass
@@ -657,15 +657,6 @@ def _parse_symbols(value):
     return [symbol.strip().upper() for symbol in value.split(",") if symbol.strip()]
 
 
-def _symbols_for_universe(name):
-    universes = {
-        "etf": ETF_UNIVERSE,
-        "stock": STOCK_UNIVERSE,
-        "combined": COMBINED_UNIVERSE,
-    }
-    return list(universes[name])
-
-
 def run_walk_forward(
     symbols=None, config=None, window_months=6, warmup_months=6,
     blocked_symbols=None,
@@ -853,12 +844,6 @@ def run_pivot_grid(label, symbols, config):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run an offline strategy backtest.")
     parser.add_argument("--symbols", help="Comma-separated symbols. Defaults to universe.py.")
-    parser.add_argument(
-        "--universe",
-        choices=["etf", "stock", "combined", "all"],
-        default="etf",
-        help="Backtest ETF-only, stock-only, combined, or all reports.",
-    )
     parser.add_argument("--period", default="1y")
     parser.add_argument("--interval", default="1h")
     parser.add_argument("--dollars-per-trade", type=float, default=DOLLARS_PER_TRADE)
@@ -928,28 +913,16 @@ if __name__ == "__main__":
             compare_exit_strategies("custom", symbols, config)
         else:
             _run_and_print_report("custom", symbols, config, args.filter_impact)
-    elif args.universe == "all":
-        for universe_name in ("etf", "stock", "combined"):
-            symbols = _symbols_for_universe(universe_name)
-            if args.walk_forward:
-                _run_walk_forward_report(
-                    universe_name, symbols, config, args.window_months,
-                    args.warmup_months,
-                )
-            else:
-                _run_and_print_report(
-                    universe_name, symbols, config, args.filter_impact,
-                )
     else:
-        symbols = _symbols_for_universe(args.universe)
+        symbols = list(ETF_UNIVERSE)
         if args.walk_forward:
             _run_walk_forward_report(
-                args.universe, symbols, config, args.window_months,
+                "etf", symbols, config, args.window_months,
                 args.warmup_months,
             )
         elif args.pivot_grid:
-            run_pivot_grid(args.universe, symbols, config)
+            run_pivot_grid("etf", symbols, config)
         elif args.compare_exits:
-            compare_exit_strategies(args.universe, symbols, config)
+            compare_exit_strategies("etf", symbols, config)
         else:
-            _run_and_print_report(args.universe, symbols, config, args.filter_impact)
+            _run_and_print_report("etf", symbols, config, args.filter_impact)

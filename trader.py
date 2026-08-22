@@ -30,6 +30,7 @@ from pivots import (
     update_pivot_state,
     update_structural_stop,
 )
+from universe import LIVE_TRADING_UNIVERSE, is_live_trading_symbol
 import csv
 import json
 import os
@@ -258,7 +259,11 @@ def get_managed_positions():
     positions = alpaca_read(
         trading_client.get_all_positions, "list ETFEnhancer-managed positions"
     )
-    return [position for position in positions if position.symbol in position_state]
+    return [
+        position for position in positions
+        if position.symbol in position_state
+        and position.symbol in LIVE_TRADING_UNIVERSE
+    ]
 
 
 def managed_entry_price(symbol, position):
@@ -324,19 +329,31 @@ def reconcile_position_state():
         "reconcile ETFEnhancer open orders",
     )
     pending_symbols = {order.symbol for order in orders}
+    disallowed_symbols = sorted(
+        symbol for symbol in position_state if symbol not in LIVE_TRADING_UNIVERSE
+    )
     stale_symbols = sorted(
         symbol for symbol in position_state
-        if symbol not in actual_symbols and symbol not in pending_symbols
+        if symbol in LIVE_TRADING_UNIVERSE
+        and symbol not in actual_symbols
+        and symbol not in pending_symbols
     )
-    if stale_symbols:
-        for symbol in stale_symbols:
+    removed_symbols = disallowed_symbols + stale_symbols
+    if removed_symbols:
+        for symbol in removed_symbols:
             position_state.pop(symbol, None)
         save_position_state()
-        print(
-            "Removed stale ETFEnhancer position state: "
-            + ", ".join(stale_symbols)
-        )
-    return stale_symbols
+        if disallowed_symbols:
+            print(
+                "Removed non-universe ETFEnhancer position state: "
+                + ", ".join(disallowed_symbols)
+            )
+        if stale_symbols:
+            print(
+                "Removed stale ETFEnhancer position state: "
+                + ", ".join(stale_symbols)
+            )
+    return removed_symbols
 
 def get_open_positions_count():
     return len(get_managed_positions())
@@ -638,6 +655,13 @@ def check_stop_loss(symbol, stop_loss_percent):
 def place_trade(
     symbol, side, qty=None, notional=15, reason="signal", position_role="tactical"
 ):
+    symbol = symbol.strip().upper() if isinstance(symbol, str) else symbol
+    if not is_live_trading_symbol(symbol):
+        print(
+            f"BLOCKED ORDER: {symbol!r} is outside ETFEnhancer's live ETF universe."
+        )
+        return False
+
     if side == "buy" and symbol in position_state:
         print("Already holding position. Skipping buy.")
         return False

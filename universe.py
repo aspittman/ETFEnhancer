@@ -11,18 +11,13 @@ OPTIONAL_ETFS = [
     "SMH", "SOXX", "VGT", "VOO", "SCHD", "IYW", "IYT"
 ]
 
-MEGA_CAPS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META",
-    "GOOGL", "AVGO", "TSLA", "AMD", "NFLX"
-]
-
-LARGE_CAP_LEADERS = [
-    "JPM", "UNH", "COST", "WMT", "HD",
-    "CAT", "LLY", "JNJ", "XOM", "CVX"
-]
-
 ETF_UNIVERSE = CORE_ETFS + SECTOR_ETFS + OPTIONAL_ETFS
-STOCK_UNIVERSE = MEGA_CAPS + LARGE_CAP_LEADERS
-COMBINED_UNIVERSE = ETF_UNIVERSE + STOCK_UNIVERSE
 
 UNIVERSE = ETF_UNIVERSE
+
+# This is the final live-trading allowlist.
+LIVE_TRADING_UNIVERSE = frozenset(UNIVERSE)
+
+
+def is_live_trading_symbol(symbol):
+    return isinstance(symbol, str) and symbol.strip().upper() in LIVE_TRADING_UNIVERSE

@@ -31,6 +31,7 @@ from trader import (
     update_midpoint_state,
 )
 from pivots import new_pivot_state, update_pivot_state, update_structural_stop
+from universe import ETF_UNIVERSE, LIVE_TRADING_UNIVERSE, UNIVERSE
 
 
 class StrategyTests(unittest.TestCase):
@@ -361,6 +362,21 @@ class BacktestConfigTests(unittest.TestCase):
 
 
 class TradingAccountTests(unittest.TestCase):
+    def test_live_universe_is_exactly_the_etf_universe(self):
+        self.assertEqual(UNIVERSE, ETF_UNIVERSE)
+        self.assertEqual(LIVE_TRADING_UNIVERSE, frozenset(ETF_UNIVERSE))
+        self.assertEqual(len(ETF_UNIVERSE), len(set(ETF_UNIVERSE)))
+
+    @patch("trader.trading_client.submit_order")
+    @patch("trader.get_position")
+    def test_order_boundary_blocks_non_universe_symbol(self, get_position, submit):
+        with patch.dict(position_state, {}, clear=True):
+            self.assertFalse(place_trade("NOTETF", "buy", notional=25))
+            self.assertFalse(place_trade("BTC/USD", "buy", notional=25))
+            self.assertFalse(place_trade("SPY260918C00500000", "buy", notional=25))
+        get_position.assert_not_called()
+        submit.assert_not_called()
+
     @patch("trader.get_position", return_value=0)
     def test_local_state_blocks_duplicate_buy_during_broker_lag(self, get_position):
         with patch.dict(
@@ -383,10 +399,11 @@ class TradingAccountTests(unittest.TestCase):
                 "XLE": {"entry_price": 60.0},
                 "XLP": {"entry_price": 85.0},
                 "XLV": {"entry_price": 170.0},
+                "NOTETF": {"entry_price": 200.0},
             },
             clear=True,
         ):
-            self.assertEqual(reconcile_position_state(), ["XLV"])
+            self.assertEqual(reconcile_position_state(), ["NOTETF", "XLV"])
             self.assertEqual(set(position_state), {"XLE", "XLP"})
             save_state.assert_called_once()
 
@@ -409,7 +426,7 @@ class TradingAccountTests(unittest.TestCase):
             )(),
             type(
                 "Position", (),
-                {"symbol": "MSFT", "qty": "10", "current_price": "500"},
+                {"symbol": "NOTETF", "qty": "10", "current_price": "500"},
             )(),
         ]
 
@@ -423,7 +440,7 @@ class TradingAccountTests(unittest.TestCase):
     @patch("trader.get_position", return_value=1)
     def test_bot_refuses_to_sell_unowned_position(self, get_position):
         with patch.dict(position_state, {}, clear=True):
-            self.assertFalse(place_trade("MSFT", "sell", qty=1, reason="test"))
+            self.assertFalse(place_trade("NOTETF", "sell", qty=1, reason="test"))
 
     @patch("trader.time.sleep")
     @patch("trader.alpaca_read")

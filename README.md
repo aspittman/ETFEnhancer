@@ -69,6 +69,11 @@ Key risk and selection settings live in `config.py`:
 The bot still manages existing positions even when a symbol is blocked or the market
 regime is weak.
 
+Live broker orders are restricted to `LIVE_TRADING_UNIVERSE`, which is an immutable
+copy of the ETF-only universe. The final order function rejects any stock, crypto,
+option, or other symbol outside that allowlist, regardless of which caller requested
+the order. No stock universe is defined by this project.
+
 ## Backtesting
 
 Run the strategy offline against historical Yahoo Finance data:
@@ -77,13 +82,10 @@ Run the strategy offline against historical Yahoo Finance data:
 python backtest.py
 ```
 
-By default this runs the ETF-only universe. Use `--universe` for other reports:
+The backtester uses the same ETF-only universe:
 
 ```bash
-python backtest.py --universe etf
-python backtest.py --universe stock
-python backtest.py --universe combined
-python backtest.py --universe all
+python backtest.py
 ```
 
 Useful options:
@@ -91,10 +93,10 @@ Useful options:
 ```bash
 python backtest.py --symbols SPY,QQQ,XLK --period 2y --interval 1h
 python backtest.py --min-score 3 --max-buys-per-bar 1
-python backtest.py --filter-impact --universe etf --period 2y
-python backtest.py --compare-exits --universe etf --period 2y
-python backtest.py --pivot-grid --universe etf --period 2y
-python backtest.py --walk-forward --window-months 6 --warmup-months 6 --cost-bps 5 --universe etf --period 2y
+python backtest.py --filter-impact --period 2y
+python backtest.py --compare-exits --period 2y
+python backtest.py --pivot-grid --period 2y
+python backtest.py --walk-forward --window-months 6 --warmup-months 6 --cost-bps 5 --period 2y
 ```
 
 The backtester uses the same pullback entry, relative-strength scoring versus SPY,
