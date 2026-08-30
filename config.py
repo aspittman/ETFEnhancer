@@ -12,6 +12,11 @@ MAX_POSITIONS = 5
 MAX_TOTAL_CAPITAL = 130
 ETF_ONLY_MODE = True
 
+# Performance reporting starts after the shared-account overlap issue was
+# corrected. Positions opened before this date are excluded from the displayed
+# ETFEnhancer gain/loss percentage.
+PERFORMANCE_START_DATE = "2026-08-21"
+
 # Benchmark-aware portfolio construction. While the market regime is healthy,
 # keep this share of bot capital in SPY and use the remainder for tactical ETF
 # pullbacks that are outperforming SPY over the relative-strength window.

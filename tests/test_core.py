@@ -433,7 +433,13 @@ class TradingAccountTests(unittest.TestCase):
 
         with patch.dict(
             position_state,
-            {"XLE": {"entry_price": 50, "qty": 0.5}},
+            {
+                "XLE": {
+                    "entry_price": 50,
+                    "qty": 0.5,
+                    "entry_filled_at": "2026-08-21T12:00:00+00:00",
+                }
+            },
             clear=True,
         ):
             self.assertAlmostEqual(get_total_market_value(), 27.5)
@@ -453,7 +459,13 @@ class TradingAccountTests(unittest.TestCase):
 
         with patch.dict(
             position_state,
-            {"XLE": {"entry_price": 50, "qty": 0.5}},
+            {
+                "XLE": {
+                    "entry_price": 50,
+                    "qty": 0.5,
+                    "entry_filled_at": "2026-08-21T12:00:00+00:00",
+                }
+            },
             clear=True,
         ):
             cost, value, pnl, percent = get_managed_performance()
@@ -461,6 +473,41 @@ class TradingAccountTests(unittest.TestCase):
         self.assertAlmostEqual(cost, 25.0)
         self.assertAlmostEqual(value, 27.5)
         self.assertAlmostEqual(pnl, 2.5)
+        self.assertAlmostEqual(percent, 10.0)
+
+    @patch("trader.trading_client.get_all_positions")
+    def test_managed_performance_excludes_positions_before_cutoff(self, get_positions):
+        get_positions.return_value = [
+            type(
+                "Position", (),
+                {"symbol": "SCHD", "qty": "1", "avg_entry_price": "25", "current_price": "100"},
+            )(),
+            type(
+                "Position", (),
+                {"symbol": "XLB", "qty": "1", "avg_entry_price": "50", "current_price": "55"},
+            )(),
+        ]
+        with patch.dict(
+            position_state,
+            {
+                "SCHD": {
+                    "entry_price": 25,
+                    "qty": 1,
+                    "entry_filled_at": "2026-08-20T23:59:59+00:00",
+                },
+                "XLB": {
+                    "entry_price": 50,
+                    "qty": 1,
+                    "entry_filled_at": "2026-08-21T00:00:00+00:00",
+                },
+            },
+            clear=True,
+        ):
+            cost, value, pnl, percent = get_managed_performance()
+
+        self.assertAlmostEqual(cost, 50.0)
+        self.assertAlmostEqual(value, 55.0)
+        self.assertAlmostEqual(pnl, 5.0)
         self.assertAlmostEqual(percent, 10.0)
 
     @patch("trader.get_position", return_value=1)

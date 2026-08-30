@@ -22,6 +22,7 @@ from config import (
     USE_TENTATIVE_HIGH_FOR_STOP,
     PIVOT_TIMEFRAME,
     PIVOT_PRICE_SOURCE,
+    PERFORMANCE_START_DATE,
 )
 from pivots import (
     build_pivot_history,
@@ -36,7 +37,7 @@ import json
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 import pandas as pd
 from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout
 
@@ -283,11 +284,34 @@ def get_total_market_value():
 
 
 def get_managed_performance():
-    """Return aggregate unrealized performance for ETFEnhancer-owned shares only."""
+    """Return post-cutoff unrealized performance for ETFEnhancer-owned shares."""
+    entry_times_by_order_id = {}
+    try:
+        with open(LOG_FILE, newline="") as file:
+            for row in csv.DictReader(file):
+                if row.get("side") == "buy" and row.get("order_id"):
+                    entry_times_by_order_id[row["order_id"]] = row.get("timestamp")
+    except FileNotFoundError:
+        pass
+
+    performance_start = date.fromisoformat(PERFORMANCE_START_DATE)
     cost_basis = 0.0
     market_value = 0.0
     for position in get_managed_positions():
         symbol = position.symbol
+        state = position_state[symbol]
+        entry_time = state.get("entry_filled_at") or entry_times_by_order_id.get(
+            str(state.get("entry_order_id", ""))
+        )
+        try:
+            entry_date = datetime.fromisoformat(str(entry_time)).date()
+        except (TypeError, ValueError):
+            # Unknown legacy entries are excluded rather than risk including
+            # shared-account activity from before the isolation fix.
+            continue
+        if entry_date < performance_start:
+            continue
+
         qty = abs(managed_quantity(symbol, position))
         cost_basis += qty * managed_entry_price(symbol, position)
         market_value += qty * float(position.current_price)
@@ -765,6 +789,11 @@ def place_trade(
                 "entry_price": combined_entry,
                 "qty": combined_qty,
                 "entry_order_id": order_id,
+                "entry_filled_at": (
+                    filled_at.isoformat()
+                    if hasattr(filled_at, "isoformat")
+                    else str(filled_at or datetime.now().isoformat())
+                ),
                 "position_role": previous.get("position_role", position_role),
                 "trade_anchor_low": previous.get("trade_anchor_low"),
                 "active_structural_low": previous.get("active_structural_low"),
@@ -809,7 +838,7 @@ def print_account_info():
     print(f"Shared Account Cash: ${account.cash}")
     print(f"ETFEnhancer Position Value: ${managed_value:.2f}")
     print(
-        "ETFEnhancer Unrealized Gain/Loss: "
+        f"ETFEnhancer Unrealized Gain/Loss Since {PERFORMANCE_START_DATE}: "
         f"${managed_pnl:+.2f} ({managed_return_percent:+.2f}%)"
     )
     print(f"Shared Account Buying Power: ${account.buying_power}")
