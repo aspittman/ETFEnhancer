@@ -282,6 +282,23 @@ def get_total_market_value():
     return total
 
 
+def get_managed_performance():
+    """Return aggregate unrealized performance for ETFEnhancer-owned shares only."""
+    cost_basis = 0.0
+    market_value = 0.0
+    for position in get_managed_positions():
+        symbol = position.symbol
+        qty = abs(managed_quantity(symbol, position))
+        cost_basis += qty * managed_entry_price(symbol, position)
+        market_value += qty * float(position.current_price)
+
+    unrealized_pnl = market_value - cost_basis
+    return_percent = (
+        (unrealized_pnl / cost_basis) * 100 if cost_basis > 0 else 0.0
+    )
+    return cost_basis, market_value, unrealized_pnl, return_percent
+
+
 def get_open_position_symbols():
     return [position.symbol for position in get_managed_positions()]
 
@@ -785,12 +802,16 @@ def place_trade(
 
 def print_account_info():
     account = alpaca_read(trading_client.get_account, "get account information")
-    managed_value = get_total_market_value()
+    _, managed_value, managed_pnl, managed_return_percent = get_managed_performance()
 
     print("\n===== ACCOUNT INFO =====")
     print(f"Shared Account Equity: ${account.equity}")
     print(f"Shared Account Cash: ${account.cash}")
     print(f"ETFEnhancer Position Value: ${managed_value:.2f}")
+    print(
+        "ETFEnhancer Unrealized Gain/Loss: "
+        f"${managed_pnl:+.2f} ({managed_return_percent:+.2f}%)"
+    )
     print(f"Shared Account Buying Power: ${account.buying_power}")
     print("========================\n")
     

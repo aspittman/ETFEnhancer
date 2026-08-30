@@ -23,6 +23,7 @@ from backtest import (
 )
 from strategy import build_strategy_frame, normalize_price_data, signal_from_row
 from trader import (
+    get_managed_performance,
     get_open_position_symbols,
     get_total_market_value,
     place_trade,
@@ -436,6 +437,31 @@ class TradingAccountTests(unittest.TestCase):
             clear=True,
         ):
             self.assertAlmostEqual(get_total_market_value(), 27.5)
+
+    @patch("trader.trading_client.get_all_positions")
+    def test_managed_performance_excludes_shared_account_positions(self, get_positions):
+        get_positions.return_value = [
+            type(
+                "Position", (),
+                {"symbol": "XLE", "qty": "2", "avg_entry_price": "50", "current_price": "55"},
+            )(),
+            type(
+                "Position", (),
+                {"symbol": "NOTETF", "qty": "10", "avg_entry_price": "100", "current_price": "500"},
+            )(),
+        ]
+
+        with patch.dict(
+            position_state,
+            {"XLE": {"entry_price": 50, "qty": 0.5}},
+            clear=True,
+        ):
+            cost, value, pnl, percent = get_managed_performance()
+
+        self.assertAlmostEqual(cost, 25.0)
+        self.assertAlmostEqual(value, 27.5)
+        self.assertAlmostEqual(pnl, 2.5)
+        self.assertAlmostEqual(percent, 10.0)
 
     @patch("trader.get_position", return_value=1)
     def test_bot_refuses_to_sell_unowned_position(self, get_position):
