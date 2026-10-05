@@ -1,4 +1,5 @@
 import time
+import math
 from dataclasses import dataclass
 
 import pandas as pd
@@ -303,12 +304,13 @@ def get_market_regime(
     period="1y",
     interval="1d",
 ):
+    # None means unavailable evidence, not a confirmed weak market.
     try:
         data = fetch_price_history(symbol, period=period, interval=interval)
         if data.empty or len(data) < ma_long + 5:
             return {
                 "symbol": symbol,
-                "is_healthy": False,
+                "is_healthy": None,
                 "reason": "not_enough_data",
             }
 
@@ -322,8 +324,8 @@ def get_market_regime(
         previous_short = float(short_ma.iloc[-2])
 
         values = [latest_close, latest_short, latest_long, previous_short]
-        if any(pd.isna(value) for value in values):
-            return {"symbol": symbol, "is_healthy": False, "reason": "nan_values"}
+        if any(not math.isfinite(value) for value in values):
+            return {"symbol": symbol, "is_healthy": None, "reason": "nan_values"}
 
         is_healthy = latest_close > latest_long and latest_short > latest_long
 
@@ -338,7 +340,7 @@ def get_market_regime(
 
     except Exception as e:
         print(f"Error checking market regime for {symbol}: {e}")
-        return {"symbol": symbol, "is_healthy": False, "reason": "error"}
+        return {"symbol": symbol, "is_healthy": None, "reason": "error"}
 
 
 def scan_universe(

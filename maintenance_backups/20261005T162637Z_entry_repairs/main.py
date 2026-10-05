@@ -8,7 +8,6 @@ from trader import (
     get_open_position_symbols,
     get_open_positions_count,
     get_total_market_value,
-    get_available_entry_capital,
     already_holding,
     trading_client,
     validate_alpaca_credentials,
@@ -23,7 +22,6 @@ from trader import is_in_cooldown
 
 from config import (
     DOLLARS_PER_TRADE,
-    MIN_TRADE_NOTIONAL,
     MAX_POSITIONS,
     MAX_TOTAL_CAPITAL,
     STOP_LOSS_PERCENT,
@@ -228,9 +226,8 @@ def run_bot():
                 print("Max positions reached.")
                 break
 
-            remaining = get_available_entry_capital()
-            if remaining < MIN_TRADE_NOTIONAL:
-                print(f"Remaining capital ${remaining:.2f} is below minimum trade ${MIN_TRADE_NOTIONAL}.")
+            if total_capital_used + DOLLARS_PER_TRADE > MAX_TOTAL_CAPITAL:
+                print("Max total capital reached.")
                 break
 
             if already_holding(symbol):
@@ -240,7 +237,7 @@ def run_bot():
             if is_in_cooldown(symbol):
                 continue
             
-            if place_trade(symbol, "buy", notional=min(DOLLARS_PER_TRADE, remaining)):
+            if place_trade(symbol, "buy", notional=DOLLARS_PER_TRADE):
                 buys_this_cycle += 1
             time.sleep(3)
 

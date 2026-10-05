@@ -275,31 +275,6 @@ def managed_quantity(symbol, position):
     return float(position_state.get(symbol, {}).get("qty", position.qty))
 
 
-def get_available_entry_capital():
-    import math
-    from config import MAX_TOTAL_CAPITAL
-    used = get_total_market_value()
-    orders = alpaca_read(lambda: trading_client.get_orders(filter=GetOrdersRequest(
-        status=QueryOrderStatus.OPEN, limit=500)), "reserve ETFEnhancer pending buys")
-    if len(orders) >= 500:
-        raise RuntimeError("Incomplete pending-order snapshot")
-    reserved = 0.0
-    for order in orders:
-        if str(getattr(order.side, 'value', order.side)).lower() != 'buy':
-            continue
-        notional = getattr(order, 'notional', None)
-        if notional is None:
-            raise RuntimeError("Unpriced pending buy; new entries blocked")
-        filled = float(order.filled_qty or 0) * float(order.filled_avg_price or 0)
-        amount = float(notional)
-        if not all(math.isfinite(v) and v >= 0 for v in (amount, filled)):
-            raise RuntimeError("Invalid pending buy reservation")
-        reserved += max(0.0, amount - filled)
-    if not math.isfinite(used) or used < 0:
-        raise RuntimeError("Invalid owned position value")
-    return max(0.0, MAX_TOTAL_CAPITAL - used - reserved)
-
-
 def get_total_market_value():
     total = 0.0
     for position in get_managed_positions():
@@ -756,13 +731,6 @@ def place_trade(
         return False
 
     if side == "buy":
-        from decimal import Decimal, ROUND_DOWN
-        from config import MIN_TRADE_NOTIONAL
-        notional = float(Decimal(str(min(notional, get_available_entry_capital()))).quantize(
-            Decimal('.01'), rounding=ROUND_DOWN))
-        if notional < MIN_TRADE_NOTIONAL:
-            print(f"Remaining allocation below ${MIN_TRADE_NOTIONAL}; skipping {symbol}.")
-            return False
         order = MarketOrderRequest(
             symbol=symbol,
             notional=notional,
